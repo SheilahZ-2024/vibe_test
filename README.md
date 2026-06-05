@@ -108,6 +108,7 @@ cd C:\Users\15924\Projects\smart-assistant\apps\api
 | GET | `/api/v1/vouchers/{voucher_id}` | 团购券详情 |
 | POST | `/api/v1/refunds` | 创建退款申请 |
 | POST | `/api/v1/chat/tickets` | 转人工工单 |
+| GET | `/health` | 健康检查 |
 | GET | `/health/llm/ping` | 模型连通性测试 |
 | GET | `/api/v1/users/{user_id}/fulfillment-events` | 履约事件列表 |
 | GET | `/api/v1/users/{user_id}/operation-logs` | 操作记录列表 |
