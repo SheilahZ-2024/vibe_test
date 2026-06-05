@@ -144,13 +144,4 @@ cd C:\Users\15924\Projects\smart-assistant\apps\api
 
 ## GitHub
 
-当前项目已 `git init`，尚未提交。确认后可执行：
-
-```powershell
-cd C:\Users\15924\Projects\smart-assistant
-git add .
-git commit -m "feat: rebuild as douyin life service assistant"
-git branch -M main
-git remote add origin https://github.com/<你的用户名>/smart-assistant.git
-git push -u origin main
-```
+仓库地址：https://github.com/SheilahZ-2024/vibe_test
