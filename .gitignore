@@ -1,0 +1,32 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.local
+
+# Build
+dist/
+build/
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs & data
+*.log
+postgres_data/
+redis_data/
+
+# Test / coverage
+.coverage
+htmlcov/
+.pytest_cache/

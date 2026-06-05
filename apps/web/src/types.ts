@@ -1,0 +1,75 @@
+export interface EdgeContext {
+  user_id: string;
+  city: string;
+  recent_order_ids: string[];
+  local_voucher_summary: string[];
+  behavior_tags: string[];
+  location_permission: boolean;
+  packet_size_bytes: number;
+}
+
+export interface PrivacySettings {
+  order_access: boolean;
+  voucher_access: boolean;
+  coupon_access: boolean;
+  location_access: boolean;
+  behavior_summary: boolean;
+  stream_response: boolean;
+}
+
+export interface Message {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  intent?: string;
+  pipeline?: PipelinePayload;
+  service_cards?: ServiceCard[];
+  tool_calls?: ToolCall[];
+}
+
+export interface PipelineStep {
+  name: string;
+  status: string;
+  detail?: string;
+}
+
+export interface PipelinePayload {
+  steps?: PipelineStep[];
+  model?: { mode?: string; latency_s?: number };
+}
+
+export interface ServiceCard {
+  type: "order" | "voucher" | "coupon" | "refund";
+  title: string;
+  status: string;
+  payload: Record<string, unknown>;
+}
+
+export interface ServiceContext {
+  user: Record<string, unknown>;
+  orders: Record<string, unknown>[];
+  vouchers: Record<string, unknown>[];
+  coupons: Record<string, unknown>[];
+  refunds: Record<string, unknown>[];
+  stores: Record<string, unknown>[];
+}
+
+export interface ToolCall {
+  name: string;
+  result?: unknown;
+}
+
+export interface WorkflowSolution {
+  action_id: string;
+  title: string;
+  description: string;
+  tool: string;
+}
+
+export interface WorkflowDiagnosis {
+  issue?: string;
+  root_cause?: string;
+  confidence?: string;
+  diagnosis?: Array<{ check: string; status: string; detail: string }>;
+  solution?: WorkflowSolution[];
+}
