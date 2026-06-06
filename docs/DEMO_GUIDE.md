@@ -128,4 +128,4 @@ docker compose up --build -d
 
 - [README](../README.md) — 快速开始
 - [ARCHITECTURE.md](./ARCHITECTURE.md) — 应答架构详解
-- [DEPLOY_ALIYUN.md](./DEPLOY_ALIYUN.md) — 云部署
+- [DEPLOY_ALIYUN.md](./DEPLOY_ALIYUN.md) — 云部署（手动 SSH + docker compose）

@@ -182,7 +182,7 @@ cd apps\api
 | [docs/DEMO_GUIDE.md](./docs/DEMO_GUIDE.md) | **Demo 样本编号对照与演示脚本** |
 | [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) | 系统架构详解（分层、对话流、SDS、seed、时间） |
 | [docs/PRODUCT.md](./docs/PRODUCT.md) | 产品原则与 Agent 定义 |
-| [docs/DEPLOY_ALIYUN.md](./docs/DEPLOY_ALIYUN.md) | 阿里云部署 |
+| [docs/DEPLOY_ALIYUN.md](./docs/DEPLOY_ALIYUN.md) | 阿里云手动部署（SSH + docker compose） |
 
 ---
 
