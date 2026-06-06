@@ -18,7 +18,10 @@ elif command -v yum &>/dev/null; then
 fi
 
 if ! command -v docker &>/dev/null; then
-  curl -fsSL https://get.docker.com | sh
+  curl -fsSL https://get.docker.com | sh 2>/dev/null || true
+  if ! command -v docker &>/dev/null; then
+    dnf install -y docker docker-compose-plugin 2>/dev/null || yum install -y docker docker-compose-plugin 2>/dev/null || yum install -y docker
+  fi
   systemctl enable docker
   systemctl start docker
 fi

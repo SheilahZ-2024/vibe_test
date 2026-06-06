@@ -9,20 +9,62 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 echo "==> 检查 Docker"
-if ! command -v docker &>/dev/null; then
+install_docker() {
+  if command -v docker &>/dev/null; then
+    return 0
+  fi
   echo "    安装 Docker..."
+  if [[ -f /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    case "${ID:-}" in
+      alinux|anolis|centos|rhel|fedora|rocky|almalinux)
+        if command -v dnf &>/dev/null; then
+          dnf install -y docker docker-compose-plugin 2>/dev/null || dnf install -y docker
+        else
+          yum install -y docker docker-compose-plugin 2>/dev/null || yum install -y docker
+        fi
+        systemctl enable docker
+        systemctl start docker
+        return 0
+        ;;
+      ubuntu|debian)
+        apt-get update -qq
+        apt-get install -y docker.io docker-compose-plugin 2>/dev/null || apt-get install -y docker.io
+        systemctl enable docker
+        systemctl start docker
+        return 0
+        ;;
+    esac
+  fi
   curl -fsSL https://get.docker.com | sh
   systemctl enable docker
   systemctl start docker
-fi
+}
 
-if ! docker compose version &>/dev/null; then
+install_docker
+
+if ! docker compose version &>/dev/null 2>&1; then
   echo "    安装 Docker Compose 插件..."
-  if command -v apt-get &>/dev/null; then
-    apt-get update -qq && apt-get install -y docker-compose-plugin
+  if command -v dnf &>/dev/null; then
+    dnf install -y docker-compose-plugin 2>/dev/null || true
   elif command -v yum &>/dev/null; then
     yum install -y docker-compose-plugin 2>/dev/null || true
+  elif command -v apt-get &>/dev/null; then
+    apt-get update -qq && apt-get install -y docker-compose-plugin 2>/dev/null || true
   fi
+fi
+
+if ! docker compose version &>/dev/null 2>&1 && command -v docker-compose &>/dev/null; then
+  echo "    使用 docker-compose 命令兼容模式"
+  docker() {
+    if [[ "$1" == "compose" ]]; then
+      shift
+      command docker-compose "$@"
+    else
+      command docker "$@"
+    fi
+  }
 fi
 
 echo "==> 准备 .env"
