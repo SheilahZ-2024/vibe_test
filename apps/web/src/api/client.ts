@@ -103,41 +103,102 @@ export async function fetchServiceContext(userId?: string): Promise<ServiceConte
   return res.json();
 }
 
+/** 统一换行符，避免 SSE `\r\n` 导致帧切分/JSON 解析失败。 */
+function normalizeSseText(text: string): string {
+  return text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+}
+
+function splitSseFrames(buffer: string): { frames: string[]; rest: string } {
+  const normalized = normalizeSseText(buffer);
+  const parts = normalized.split("\n\n");
+  const rest = parts.pop() ?? "";
+  return { frames: parts, rest };
+}
+
 function parseSseFrame(frame: string): { event: string; data: string } | null {
   if (!frame.trim()) return null;
   let event = "message";
-  let data = "";
-  for (const rawLine of frame.split(/\r?\n/)) {
+  const dataLines: string[] = [];
+  for (const rawLine of normalizeSseText(frame).split("\n")) {
     const line = rawLine.trim();
     if (!line || line.startsWith(":")) continue;
-    if (line.startsWith("event:")) event = line.slice(6).trim();
-    if (line.startsWith("data:")) data += line.slice(5).trim();
+    if (line.startsWith("event:")) {
+      event = line.slice(6).trim();
+      continue;
+    }
+    if (line.startsWith("data:")) {
+      const value = line.slice(5);
+      dataLines.push(value.startsWith(" ") ? value.slice(1) : value);
+    }
   }
+  const data = dataLines.join("\n").trim();
   return data ? { event, data } : null;
+}
+
+function parseSseJson(data: string): unknown {
+  return JSON.parse(data.replace(/\r/g, ""));
+}
+
+type StreamChatHandlers = {
+  onPipeline?: (payload: {
+    intent?: string;
+    pipeline?: { steps?: PipelineStep[] };
+    service_cards?: unknown[];
+    case?: Record<string, unknown>;
+    focus_order_id?: string | null;
+    agent_trace?: Array<Record<string, unknown>>;
+  }) => void;
+  onThinking?: (payload: { line?: string }) => void;
+  onThinkingToken?: (text: string) => void;
+  onToken?: (text: string) => void;
+  onDone?: (data: Record<string, unknown>) => void;
+  onError?: (err: Error) => void;
+};
+
+function dispatchSseEvent(
+  event: string,
+  parsed: Record<string, unknown>,
+  handlers: StreamChatHandlers,
+  state: { sawDone: boolean },
+): void {
+  if (event === "pipeline") {
+    handlers.onPipeline?.(parsed as Parameters<NonNullable<StreamChatHandlers["onPipeline"]>>[0]);
+  }
+  if (event === "thinking" && parsed.line) handlers.onThinking?.({ line: String(parsed.line) });
+  if (event === "thinking_token" && parsed.text) handlers.onThinkingToken?.(String(parsed.text));
+  if (event === "token" && parsed.text) handlers.onToken?.(String(parsed.text));
+  if (event === "error") {
+    throw new Error(String(parsed.message ?? "服务端处理失败"));
+  }
+  if (event === "done") {
+    state.sawDone = true;
+    handlers.onDone?.(parsed);
+  }
+}
+
+function consumeSseFrame(frame: string, handlers: StreamChatHandlers, state: { sawDone: boolean }): void {
+  const parsedFrame = parseSseFrame(frame);
+  if (!parsedFrame) return;
+  const { event, data } = parsedFrame;
+  let parsed: unknown;
+  try {
+    parsed = parseSseJson(data);
+  } catch {
+    console.warn("[streamChat] 跳过无法解析的 SSE 帧", { event, preview: data.slice(0, 120) });
+    return;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
+  dispatchSseEvent(event, parsed as Record<string, unknown>, handlers, state);
 }
 
 export async function streamChat(
   sessionId: string,
   message: string,
   edge: EdgeContext,
-  handlers: {
-    onPipeline?: (payload: {
-      intent: string;
-      pipeline: { steps?: PipelineStep[] };
-      service_cards?: unknown[];
-      case?: Record<string, unknown>;
-      focus_order_id?: string | null;
-      agent_trace?: Array<Record<string, unknown>>;
-    }) => void;
-    onThinking?: (payload: { line?: string }) => void;
-    onToken?: (text: string) => void;
-    onReplyReset?: () => void;
-    onDone?: (data: Record<string, unknown>) => void;
-    onError?: (err: Error) => void;
-  },
+  handlers: StreamChatHandlers,
   timeoutMs = 120_000
 ): Promise<void> {
-  let sawDone = false;
+  const state = { sawDone: false };
   const controller = new AbortController();
   const timer = window.setTimeout(() => controller.abort(), timeoutMs);
 
@@ -162,61 +223,32 @@ export async function streamChat(
       const { done, value } = await reader.read();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
-      const frames = buffer.split(/\r?\n\r?\n/);
-      buffer = frames.pop() ?? "";
-      for (const frame of frames) {
-        const parsedFrame = parseSseFrame(frame);
-        if (!parsedFrame) continue;
-        const { event, data } = parsedFrame;
+      const split = splitSseFrames(buffer);
+      buffer = split.rest;
+      for (const frame of split.frames) {
         try {
-          const parsed = JSON.parse(data);
-          if (event === "pipeline") handlers.onPipeline?.(parsed);
-          if (event === "react_step") handlers.onPipeline?.(parsed);
-          if (event === "thinking" && parsed.line) handlers.onThinking?.(parsed);
-          if (event === "reply_reset") handlers.onReplyReset?.();
-          if (event === "token" && parsed.text) handlers.onToken?.(parsed.text);
-          if (event === "error") {
-            handlers.onError?.(new Error(String(parsed.message ?? "服务端处理失败")));
-            return;
-          }
-          if (event === "done") {
-            sawDone = true;
-            handlers.onDone?.(parsed);
-          }
-        } catch {
-          handlers.onError?.(new Error("流式响应解析失败"));
+          consumeSseFrame(frame, handlers, state);
+        } catch (err) {
+          handlers.onError?.(err instanceof Error ? err : new Error("服务端处理失败"));
           return;
         }
       }
     }
 
+    buffer += decoder.decode();
     if (buffer.trim()) {
-      const parsedFrame = parseSseFrame(buffer);
-      if (parsedFrame) {
-        const { event, data } = parsedFrame;
+      const split = splitSseFrames(`${buffer}\n\n`);
+      for (const frame of split.frames) {
         try {
-          const parsed = JSON.parse(data);
-          if (event === "pipeline") handlers.onPipeline?.(parsed);
-          if (event === "react_step") handlers.onPipeline?.(parsed);
-          if (event === "thinking" && parsed.line) handlers.onThinking?.(parsed);
-          if (event === "reply_reset") handlers.onReplyReset?.();
-          if (event === "token" && parsed.text) handlers.onToken?.(parsed.text);
-          if (event === "error") {
-            handlers.onError?.(new Error(String(parsed.message ?? "服务端处理失败")));
-            return;
-          }
-          if (event === "done") {
-            sawDone = true;
-            handlers.onDone?.(parsed);
-          }
-        } catch {
-          handlers.onError?.(new Error("流式响应解析失败"));
+          consumeSseFrame(frame, handlers, state);
+        } catch (err) {
+          handlers.onError?.(err instanceof Error ? err : new Error("服务端处理失败"));
           return;
         }
       }
     }
 
-    if (!sawDone) {
+    if (!state.sawDone) {
       handlers.onError?.(new Error("对话流提前结束，未收到完整回复"));
     }
   } catch (err) {

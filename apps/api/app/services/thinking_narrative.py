@@ -6,6 +6,13 @@ import re
 from typing import Any
 
 from app.services.intent import INTENT_CATALOG, IntentResult
+from app.services.tool_payloads import (
+    normalize_focus_bundle,
+    order_from_payload,
+    store_from_payload,
+    voucher_from_payload,
+)
+from app.services.usage_rules import reservation_context
 
 # 只去掉内部编号，保留语义
 _STRIP_PATTERNS = [
@@ -78,11 +85,10 @@ def build_session_opening_lines(
     lines: list[str] = []
     orders = service_context.get("orders") or []
 
-    lines.append(f"您说的是：「{_clip(message, 48)}」")
-    lines.append(f"看起来{_user_need_phrase(intent.route_intent)}")
+    lines.append(f"嗯，{_user_need_phrase(intent.route_intent)}。")
 
     if intent.needs_clarify:
-        lines.append("我还需要再听您补充一两句，才能确定具体要帮您办哪件事")
+        lines.append("不过您刚说的我还差一点点信息，得再确认下才能帮您办")
     elif intent.alternatives:
         alt_labels: list[str] = []
         for alt in intent.alternatives[:2]:
@@ -93,15 +99,15 @@ def build_session_opening_lines(
             if desc:
                 alt_labels.append(desc.split("（")[0].strip())
         if alt_labels:
-            joined = "」或「".join(alt_labels[:2])
-            lines.append(f"也不排除跟「{joined}」有关，我先按您刚才说的往下查")
+            joined = "、".join(alt_labels[:2])
+            lines.append(f"也不排除跟{joined}沾边，我先按您刚才说的往下查")
 
     if len(orders) > 1:
-        lines.append(f"您账户里目前有 {len(orders)} 笔订单，得先对上是哪一笔")
+        lines.append(f"您这边有 {len(orders)} 笔订单，得先对上是哪一笔")
     elif len(orders) == 1:
         title = str(orders[0].get("title") or "")
         if title:
-            lines.append(f"先围绕「{_clip(title, 20)}」这笔展开")
+            lines.append(f"我先围绕「{_clip(title, 20)}」这笔看看")
 
     return [ln for ln in lines if ln.strip()]
 
@@ -110,9 +116,93 @@ def build_knowledge_thought_lines(titles: list[str]) -> list[str]:
     if not titles:
         return []
     if len(titles) == 1:
-        return [f"我会参考「{titles[0]}」里的平台规则，避免跟您说偏"]
+        return [f"我翻翻「{titles[0]}」里的规则，别跟您说岔了"]
     joined = "」「".join(titles[:3])
-    return [f"我会对照「{joined}」等规则来推理，不是凭感觉答"]
+    return [f"我对照下「{joined}」这些规则再答，不瞎猜"]
+
+
+_UNCERTAIN_HINTS = (
+    "可能",
+    "不确定",
+    "再看看",
+    "核实",
+    "怀疑",
+    "不太",
+    "也许",
+    "还得",
+    "再查",
+    "不够",
+    "遗漏",
+    "再确认",
+)
+
+
+def _looks_uncertain(text: str) -> bool:
+    return any(h in text for h in _UNCERTAIN_HINTS)
+
+
+def _brief_prev_step(prev: dict[str, Any]) -> str:
+    action = str(prev.get("action") or "")
+    if prev.get("error"):
+        return "刚才那一步没走通"
+    obs = prev.get("observation")
+    if isinstance(obs, dict) and obs.get("ok") is False:
+        err = str(obs.get("error") or "结果不太对")
+        return _sanitize(err, 80)
+    phrase = _TOOL_PHRASES.get(action, "查了一圈")
+    lines = _observation_lines(action, obs, {})
+    if lines:
+        return f"{phrase}，{lines[0]}"
+    return phrase
+
+
+def build_react_loop_bridge_lines(
+    *,
+    step_idx: int,
+    prev_trace: dict[str, Any] | None,
+    thought: str = "",
+) -> list[str]:
+    """ReAct 进入下一轮前：承接上一步，表达「再想想」。"""
+    if step_idx <= 1 or not prev_trace:
+        return []
+
+    lines: list[str] = []
+    summary = _brief_prev_step(prev_trace)
+
+    if prev_trace.get("error"):
+        lines.append("欸，刚才那步好像不太对，我换个思路再看看。")
+    else:
+        lines.append(f"好，{summary}。")
+
+    if thought and _looks_uncertain(thought):
+        cleaned = _sanitize(thought, 160)
+        if cleaned:
+            lines.append(f"嗯…{cleaned}")
+        lines.append("感觉还不够准，再核实一下。")
+    elif step_idx >= 3:
+        lines.append("我再核对一轮，免得漏掉对您重要的细节。")
+    else:
+        lines.append("还差一块信息，接着往下捋。")
+
+    return lines
+
+
+def build_react_reconsider_lines(*, reason: str) -> list[str]:
+    return [f"欸，{reason}，我重新捋一下下一步。"]
+
+
+def build_react_continue_lines(
+    *,
+    thought: str,
+    step_idx: int,
+    max_steps: int,
+) -> list[str]:
+    """工具执行完、尚未 finish 时，提示还会继续循环。"""
+    if step_idx >= max_steps - 1:
+        return ["步数快用完了，我尽量用已有信息给您说结论。"]
+    if _looks_uncertain(thought):
+        return ["嗯…刚才的判断还不够稳，再查一项印证下。"]
+    return ["这条线先记下，接着往下捋。"]
 
 
 def build_pre_action_thought_lines(
@@ -126,17 +216,23 @@ def build_pre_action_thought_lines(
     cleaned = _sanitize(thought, 320)
 
     if cleaned:
-        for part in _split_sentences(cleaned):
-            lines.append(f"#{step_idx} 我在推：{part}")
+        parts = _split_sentences(cleaned)
+        for i, part in enumerate(parts):
+            if i == 0 and step_idx > 1:
+                lines.append(f"接下来{part}")
+            elif _looks_uncertain(part):
+                lines.append(f"嗯…{part}")
+            else:
+                lines.append(part)
     elif action != "finish":
-        lines.append(f"#{step_idx} 继续往下排查")
+        lines.append("继续往下看看还缺哪块信息。")
 
     if action == "finish":
         return lines
 
     plan = _plan_phrase(action, action_input or {})
     if plan:
-        lines.append(f"#{step_idx} 下一步打算：{plan}")
+        lines.append(f"那我先{plan}。")
 
     return lines
 
@@ -155,11 +251,14 @@ def build_post_action_thought_lines(
     lines: list[str] = []
     obs_lines = _observation_lines(action, observation, service_context)
     for obs in obs_lines:
-        lines.append(f"#{step_idx} 查到：{obs}")
+        lines.append(obs)
 
     judgment = _judgment_line(action, observation, thought)
     if judgment:
-        lines.append(f"#{step_idx} 判断：{judgment}")
+        if _looks_uncertain(thought):
+            lines.append(f"不过{judgment}，我还不敢完全说死。")
+        else:
+            lines.append(judgment)
 
     return lines
 
@@ -174,37 +273,45 @@ def build_finish_thought_lines(
     cleaned = _sanitize(thought, 320)
     if cleaned:
         for part in _split_sentences(cleaned):
-            lines.append(f"#{step_idx} 结论推理：{part}")
+            lines.append(part)
 
     reasoning = _sanitize(str(finish.get("reasoning") or ""), 240)
     if reasoning and reasoning not in (cleaned or ""):
-        lines.append(f"#{step_idx} 为何可以回复：{reasoning}")
+        lines.append(reasoning)
 
     mode = str(finish.get("mode") or "reply")
     safe = finish.get("safe_to_send", True)
     if mode == "clarify":
-        lines.append(f"#{step_idx} 决定：信息仍不够，回复里会先向您确认关键点")
+        lines.append("信息还不够全，正式回复里会先跟您确认关键点。")
     elif not safe:
-        lines.append(f"#{step_idx} 决定：事实未完全对齐，回复以核实为主，不给死话")
+        lines.append("有些细节还不能说死，回复会以核实和补充信息为主。")
     else:
         actions = finish.get("suggested_actions") or []
         if actions:
             titles = "、".join(str(a.get("title") or "") for a in actions[:3] if a.get("title"))
-            lines.append(f"#{step_idx} 决定：可以给您方案了，并建议您：{titles}")
+            lines.append(f"方案齐了，回复里会建议您{titles}。")
         else:
-            lines.append(f"#{step_idx} 决定：信息够了，可以给您明确答复")
-
-    draft = str(finish.get("draft_message") or "").strip()
-    if draft and len(draft) >= 20:
-        lines.append(f"#{step_idx} 回复构思：{_clip(draft, 100)}")
+            lines.append("关键信息都对上了，可以给您明确答复啦。")
 
     return lines
 
 
 def build_pre_reply_thought_lines(*, tone_polish: bool) -> list[str]:
     if tone_polish:
-        return ["正文有了，最后润一下语气和表达，让您读着更顺"]
-    return ["正在把结论组织成给您看的回复"]
+        return ["正文写好了，润一下语气，马上给您看。"]
+    return ["把结论整理成正式回复，马上给您看。"]
+
+
+def build_fast_turn_thought_lines(turn_mode: str) -> list[str]:
+    if turn_mode == "acknowledgment":
+        return [
+            "好的收到～",
+            "我简短回您，不再从头查一遍啦。",
+        ]
+    return [
+        "接着刚才的话题说～",
+        "上一轮查到的还在，我直接接着用。",
+    ]
 
 
 def build_react_thought_lines(
@@ -235,18 +342,18 @@ def build_react_thought_lines(
 
 def _user_need_phrase(code: str) -> str:
     if code == "clarify":
-        return "您还没完全说清想办哪件事，需要再确认一下"
+        return "您还没完全说清想办哪件事，我得再确认下"
     if code == "chitchat":
-        return "您可能在寒暄，我会先回应并引导到订单或券的问题"
+        return "像是在闲聊，我先应一声，再引导到订单或券"
     if code == "unconfigured":
-        return "您的问题我还需要多听几句才能明白"
+        return "我还得多听两句才能明白您要啥"
     desc = INTENT_CATALOG.get(code) or _INTENT_LABELS.get(code, "")
     if not desc:
-        return "您可能是想咨询生活服务相关的问题"
+        return "像是想咨询生活服务这边的事"
     head = desc.split("（")[0].strip()
     if head.startswith(("查询", "判断", "申请")):
-        return f"您可能是想{head}"
-    return f"您可能需要{head}"
+        return f"像是想{head}"
+    return f"可能是{head}相关"
 
 
 def _replace_intent_codes(text: str) -> str:
@@ -363,7 +470,7 @@ def _observation_lines(action: str, observation: Any, ctx: dict) -> list[str]:
         return ["，".join(parts)]
 
     if action == "query_voucher":
-        voucher = obs.get("voucher") or {}
+        voucher = voucher_from_payload(obs)
         if not voucher:
             return ["未找到关联团购券"]
         title = _clip(str(voucher.get("title") or "券"), 16)
@@ -371,11 +478,39 @@ def _observation_lines(action: str, observation: Any, ctx: dict) -> list[str]:
         line = f"券「{title}」{status}"
         rule = str(voucher.get("usage_rule") or "")
         if rule:
-            line += f"；使用规则：{_clip(rule, 50)}"
+            line += f"，{_clip(rule, 56)}"
         code = voucher.get("code")
         if code:
             line += f"；券码 {str(code)[:8]}…" if len(str(code)) > 8 else f"；券码 {code}"
         return [line]
+
+    if action == "query_focus_bundle":
+        bundle = normalize_focus_bundle(obs if isinstance(obs, dict) else {})
+        lines: list[str] = []
+        order = order_from_payload(bundle) or {}
+        if order.get("title"):
+            lines.append(
+                f"订单「{_clip(str(order['title']), 18)}」{_status_phrase(str(order.get('status') or ''))}"
+            )
+        voucher = voucher_from_payload(bundle) or {}
+        if voucher:
+            rule = str(voucher.get("usage_rule") or "")
+            if rule:
+                lines.append(_clip(rule, 72))
+            store = store_from_payload(bundle) or {}
+            resv = reservation_context(
+                usage_rule=rule,
+                service_type=str(order.get("service_type") or ""),
+                supports_reservation=bool(store.get("supports_reservation")),
+                order_metadata=order.get("metadata") if isinstance(order.get("metadata"), dict) else {},
+            )
+            lines.append(f"预约要求：{resv['label']}，{resv['detail'][:48]}")
+        store = store_from_payload(bundle) or {}
+        if store.get("store_name"):
+            lines.append(
+                f"门店 {_clip(str(store['store_name']), 16)}，营业 {store.get('business_hours') or '待确认'}"
+            )
+        return lines
 
     if action == "query_store":
         store = obs.get("store") or {}
@@ -430,7 +565,7 @@ def _diagnosis_lines(obs: dict) -> list[str]:
             continue
         mark = "✓" if status in ("ok", "pass", "yes") else "✗" if status in ("fail", "failed", "no") else "·"
         body = detail or check
-        lines.append(f"{mark} {check}：{_clip(body, 56)}" if check else f"{mark} {_clip(body, 64)}")
+        lines.append(f"{mark} {_clip(body, 64)}" if not check else f"{mark} {_clip(check, 24)}，{_clip(body, 48)}")
 
     solutions = obs.get("solution") or []
     if solutions:
@@ -461,7 +596,9 @@ def _judgment_line(action: str, observation: Any, thought: str) -> str | None:
             return "订单/券已过期，得看是否还能过期退"
 
     if action == "query_voucher":
-        voucher = observation.get("voucher") or {}
+        voucher = voucher_from_payload(observation if isinstance(observation, dict) else {})
+        if not voucher:
+            return None
         st = str(voucher.get("status") or "")
         if st == "unused":
             return "平台侧券仍有效，若现场用不了，更该查门店或设备"

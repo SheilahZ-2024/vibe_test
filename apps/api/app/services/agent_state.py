@@ -93,6 +93,8 @@ class AgentRunResult:
         if not self.finish.approved_case_id and not self.finish.suggested_actions:
             return None
         latest = self.diagnosis_advisories[-1] if self.diagnosis_advisories else {}
+        if not isinstance(latest, dict):
+            latest = {}
         payload = dict(latest) if latest else {}
         if self.finish.approved_case_id:
             payload["case_id"] = self.finish.approved_case_id
@@ -119,3 +121,4 @@ class AgentState:
     focus_bundle_cache: dict[str, Any] | None = None
     executed_tools: set[str] = field(default_factory=set)
     prefetch_done: bool = False
+    prior_agent_ctx: dict[str, Any] | None = None

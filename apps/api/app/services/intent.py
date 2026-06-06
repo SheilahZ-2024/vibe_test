@@ -43,7 +43,7 @@ INTENT_CATALOG: dict[str, str] = {
     "QueryVoucher": "查询团购券/券码/有效期/怎么用",
     "QueryCoupon": "查询平台优惠券状态与规则",
     "QueryStore": "查询门店地址、营业时间、电话",
-    "QueryReservation": "查询预约是否成功",
+    "QueryReservation": "查询预约是否成功、如何预约/预约方式",
     "QueryRefund": "查询退款/售后进度",
     "QueryTicket": "查询工单进度",
     "CheckVoucherAvailability": "判断券能不能用、资格校验",
@@ -78,11 +78,13 @@ class IntentResult:
     needs_clarify: bool
     alternatives: list[dict[str, float | str]] = field(default_factory=list)
     route_category: str = "configured"  # configured | chitchat | unconfigured
+    turn_mode: str = "full"  # full | continuation | acknowledgment | topic_shift
 
     def to_pipeline_detail(self) -> str:
         flag = "需澄清" if self.needs_clarify else "已路由"
+        turn = f", {self.turn_mode}" if self.turn_mode != "full" else ""
         return (
-            f"[{self.route_category}] {self.route_intent} ({self.confidence:.0%}, {self.source}, {flag})"
+            f"[{self.route_category}] {self.route_intent} ({self.confidence:.0%}, {self.source}{turn}, {flag})"
             f"{f' — {self.reasoning}' if self.reasoning else ''}"
         )
 
@@ -103,12 +105,91 @@ _KEYWORD_RULES: list[tuple[str, tuple[str, ...], float]] = [
     ("QueryCoupon", ("优惠券", "满减", "用不了券", "不能叠加"), 0.82),
     ("QueryVoucher", ("券码", "团购券", "二维码", "还能用", "看看券", "券在哪", "我的券"), 0.84),
     ("QueryStore", ("营业", "几点", "地址", "电话", "搬迁"), 0.8),
-    ("QueryReservation", ("预约状态", "约了吗"), 0.78),
+    ("CheckVoucherAvailability", ("没预约", "能否核销", "能不能核销", "能核销吗", "可以核销", "没约能", "未预约"), 0.86),
+    ("QueryReservation", ("预约状态", "约了吗", "怎么预约", "如何预约", "预约方式", "在哪约", "怎么约", "去哪约"), 0.82),
+    ("CheckReservationEligibility", ("能不能约", "可以预约吗", "需要预约吗", "要不要预约"), 0.8),
     ("QueryRefund", ("退款进度", "退到哪", "什么时候退", "退款失败"), 0.82),
     ("QueryOrder", ("订单", "团购", "付款成功", "买的", "付了钱", "看看订单", "我的团购"), 0.8),
     ("HumanTransfer", ("人工", "投诉", "客服", "真人"), 0.9),
     ("chitchat", ("你好", "谢谢", "在吗", "哈哈", "早上好"), 0.75),
 ]
+
+_ACK_WORDS = ("谢谢", "感谢", "多谢", "好的", "好哒", "明白", "知道了", "收到", "嗯嗯", "没问题", "OK", "ok")
+_CONT_PREFIX = ("那", "然后", "还有", "另外", "刚才", "这个", "再问", "顺便")
+_CONT_SUFFIX = ("呢", "吗")
+_TOPIC_SHIFT = ("换个话题", "另外一笔", "别的订单", "不聊这个", "重新来", "新问题")
+_CONT_BLOCK = ("预约", "核销", "退款", "订单", "券", "投诉", "人工")
+
+
+def _has_assistant_turn(history: list[dict]) -> bool:
+    return any(m.get("role") == "assistant" for m in history[-8:])
+
+
+def _keyword_turn_mode(message: str, history: list[dict], agent_ctx: dict | None) -> str | None:
+    """有会话记忆时的接话/致谢判定（关键词层，偏保守，避免把新问题误判为接话）。"""
+    if not history or not _has_assistant_turn(history) or not agent_ctx:
+        return None
+    text = message.strip()
+    if not text:
+        return None
+    if any(k in text for k in _TOPIC_SHIFT):
+        return "topic_shift"
+    if len(text) <= 16 and any(k in text for k in _ACK_WORDS):
+        return "acknowledgment"
+    # 接话：明显承接词开头，或极短省略追问（电话呢/退款呢）
+    if len(text) <= 32 and any(text.startswith(p) for p in _CONT_PREFIX):
+        return "continuation"
+    if len(text) <= 6 and text.endswith(_CONT_SUFFIX):
+        if len(text) > 4 and any(k in text for k in _CONT_BLOCK):
+            return None
+        return "continuation"
+    return None
+
+
+def _prior_intent_inheritable(agent_ctx: dict) -> bool:
+    prior = str(agent_ctx.get("intent") or "").strip()
+    return prior not in ("", "clarify", "chitchat", "unconfigured")
+
+
+def _apply_continuation_intent(kw: IntentResult, agent_ctx: dict) -> IntentResult:
+    """接话轮次：在关键词已命中 intent 时，仍继承上一轮 route intent 供 ReAct 复用上下文。"""
+    if not _prior_intent_inheritable(agent_ctx):
+        return kw
+    kw.turn_mode = "continuation"
+    kw.route_intent = str(agent_ctx["intent"])
+    kw.raw_intent = kw.route_intent
+    kw.route_category = str(agent_ctx.get("route_category") or kw.route_category)
+    kw.reasoning = (kw.reasoning or "") + "；接上一轮继续聊"
+    kw.needs_clarify = False
+    return kw
+
+
+def _intent_from_context(agent_ctx: dict, *, acknowledgment: bool = False) -> tuple[str, str, str]:
+    intent = str(agent_ctx.get("intent") or "clarify")
+    category = str(agent_ctx.get("route_category") or "configured")
+    if acknowledgment:
+        return "chitchat", "chitchat", "chitchat"
+    return intent, intent, category
+
+
+def _result_from_turn_hint(
+    turn_mode: str,
+    message: str,
+    agent_ctx: dict,
+) -> IntentResult:
+    raw, route, category = _intent_from_context(agent_ctx, acknowledgment=(turn_mode == "acknowledgment"))
+    reasoning = "用户致谢或确认，承接上一句即可" if turn_mode == "acknowledgment" else "用户在追问上一话题，优先复用已查事实"
+    return IntentResult(
+        raw_intent=raw,
+        route_intent=route,
+        confidence=0.9,
+        reasoning=reasoning,
+        source="turn_hint",
+        needs_clarify=False,
+        alternatives=[],
+        route_category=category,
+        turn_mode=turn_mode,
+    )
 
 
 def preview_intent_for_retrieval(message: str) -> str:
@@ -209,22 +290,58 @@ class IntentClassifier:
     def __init__(self, llm: LLMService | None = None):
         self.llm = llm or LLMService()
 
-    async def classify(self, message: str, history: list[dict] | None = None) -> IntentResult:
-        """关键词优先：高置信度直接路由，仅模糊表达才调用轻量 LLM。"""
-        kw = _keyword_classify(message)
+    async def classify(
+        self,
+        message: str,
+        history: list[dict] | None = None,
+        agent_ctx: dict | None = None,
+    ) -> IntentResult:
+        """关键词 + 会话接话判定；模糊表达才调轻量 LLM。"""
+        history = history or []
         threshold = settings.intent_confidence_threshold
+
+        turn_hint = _keyword_turn_mode(message, history, agent_ctx)
+        if turn_hint == "acknowledgment" and agent_ctx:
+            return _result_from_turn_hint(turn_hint, message, agent_ctx)
+
+        kw = _keyword_classify(message)
+        if (
+            history
+            and agent_ctx
+            and len(message.strip()) <= 16
+            and (kw.raw_intent == "chitchat" or any(k in message for k in _ACK_WORDS))
+        ):
+            return _result_from_turn_hint("acknowledgment", message, agent_ctx)
+
         if kw.route_intent != "clarify" and kw.confidence >= threshold:
+            if history and agent_ctx and turn_hint == "continuation":
+                kw = _apply_continuation_intent(kw, agent_ctx)
             return kw
+
+        if turn_hint == "continuation" and agent_ctx and _prior_intent_inheritable(agent_ctx):
+            return _result_from_turn_hint("continuation", message, agent_ctx)
+
         if settings.intent_use_llm and not self.llm.use_mock:
-            llm_result = await self._classify_with_llm(message, history or [])
+            llm_result = await self._classify_with_llm(message, history, agent_ctx)
             if llm_result:
                 return llm_result
         return kw
 
-    async def _classify_with_llm(self, message: str, history: list[dict]) -> IntentResult | None:
-        recent = "\n".join(f"{m['role']}: {m['content'][:120]}" for m in history[-4:]) or "无"
+    async def _classify_with_llm(
+        self,
+        message: str,
+        history: list[dict],
+        agent_ctx: dict | None = None,
+    ) -> IntentResult | None:
+        recent = "\n".join(f"{m['role']}: {m['content'][:120]}" for m in history[-6:]) or "无"
+        memory_hint = ""
+        if agent_ctx:
+            memory_hint = (
+                f"\n上一轮意图：{agent_ctx.get('intent') or '?'}\n"
+                f"已查事实摘要：{(agent_ctx.get('digest') or '无')[:240]}"
+            )
 
-        system = f"""你是抖音生活服务 SDS v1 意图分类器。理解口语、省略、口水话，输出 JSON。
+        system = f"""你是抖音生活服务 SDS v1 意图分类器。理解口语、省略、指代（「那」「这个」）、口水话，结合对话判断本轮怎么处理。
 
 已配置 Intent 列表（route_category=configured 时从中选择 intent）：
 {chr(10).join(f"- {k}: {v}" for k, v in INTENT_CATALOG.items() if k not in ("chitchat", "clarify", "unconfigured"))}
@@ -234,16 +351,29 @@ route_category 三类（必填）：
 - chitchat：寒暄、与履约无关
 - unconfigured：明确是履约/生活诉求，但不在已配置 Intent 中
 
+turn_mode（必填，判断是否为「冷启动」）：
+- full：新话题/换订单/与上一轮无关；或**首轮**涉及资格判断（如没预约能核销吗、能不能退款）
+- continuation：明确承接上一轮，只补充细节或程序性追问（那电话呢、那怎么预约、门店地址呢）
+- acknowledgment：致谢、好的、明白了等短接话
+- topic_shift：明确换话题或换订单
+
 规则：
-1. 「到了刷不出来」「老板不给用」→ configured + VoucherUnavailable
-2. 明显闲聊 → chitchat
-3. 无法判断具体 Intent 但仍属履约 → configured + clarify 且 confidence 偏低
-4. confidence 0~1；alternatives 给 1-2 个次选
+1. 有对话历史时，短句「谢谢/好的/明白了」→ acknowledgment + chitchat
+2. 同话题省略/程序性追问：「那退款呢」「那怎么预约」「电话多少」「门店呢」→ continuation，intent **延续上一轮**（不要 unconfigured）
+3. 规则 2 优先于「含怎么/如何」：同话题下的「怎么/如何 + 预约/电话/地址/退款」仍是 continuation，不是 full
+4. **无历史或明显换话题**时，含「没预约/能不能核销/为什么用不了」等资格判断 → full
+5. 明显全新履约问题 → full
+6. confidence 0~1；alternatives 给 1-2 个次选
 
 只输出 JSON：
-{{"route_category":"configured|chitchat|unconfigured", "intent":"...", "confidence":0.0, "reasoning":"...", "alternatives":[{{"intent":"...", "confidence":0.0}}]}}"""
+{{"route_category":"...", "intent":"...", "confidence":0.0, "turn_mode":"full|continuation|acknowledgment|topic_shift", "reasoning":"...", "alternatives":[{{"intent":"...", "confidence":0.0}}]}}"""
 
-        raw = await self.llm.complete(system, f"最近对话：\n{recent}\n\n用户最新：{message}", temperature=settings.intent_llm_temperature, max_tokens=settings.intent_llm_max_tokens)
+        raw = await self.llm.complete(
+            system,
+            f"最近对话：\n{recent}{memory_hint}\n\n用户最新：{message}",
+            temperature=settings.intent_llm_temperature,
+            max_tokens=settings.intent_llm_max_tokens,
+        )
         if not raw:
             return None
         data = _parse_llm_json(raw)
@@ -267,6 +397,20 @@ route_category 三类（必填）：
             confidence = 0.0
 
         reasoning = str(data.get("reasoning") or "").strip()
+        turn_mode = str(data.get("turn_mode") or "full").strip()
+        if turn_mode not in ("full", "continuation", "acknowledgment", "topic_shift"):
+            turn_mode = "full"
+        if not history and turn_mode != "full":
+            turn_mode = "full"
+        if turn_mode == "topic_shift":
+            turn_mode = "full"
+        if turn_mode == "acknowledgment":
+            route_category = "chitchat"
+            raw_intent = "chitchat"
+        elif turn_mode == "continuation" and agent_ctx and agent_ctx.get("intent"):
+            raw_intent = str(agent_ctx["intent"])
+            route_category = str(agent_ctx.get("route_category") or route_category)
+
         alternatives: list[dict[str, float | str]] = []
         for item in data.get("alternatives") or []:
             if not isinstance(item, dict):
@@ -280,6 +424,7 @@ route_category 三类（必填）：
                 pass
 
         result = _apply_threshold(raw_intent, confidence, reasoning, "llm", alternatives)
+        result.turn_mode = turn_mode
         if route_category == "unconfigured":
             result.route_category = "unconfigured"
             result.route_intent = "unconfigured"

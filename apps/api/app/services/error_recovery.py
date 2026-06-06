@@ -182,9 +182,11 @@ class ErrorRecoveryService:
         history: list[dict] | None = None,
         session_id: str = "",
         partial_trace: list[dict] | None = None,
+        emit_thinking: bool = True,
     ) -> AsyncIterator[tuple[str, dict]]:
         clues = build_recovery_clues(exc, message=message, service_context=service_context)
-        yield "thinking", {"line": "主流程异常，正在根据您的订单与描述重新整理回复…"}
+        if emit_thinking:
+            yield "thinking", {"line": "主流程异常，正在根据您的订单与描述重新整理回复…"}
         yield "pipeline", {
             "session_id": session_id,
             "intent": clues.get("suggested_intent") or "clarify",

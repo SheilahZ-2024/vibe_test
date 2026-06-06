@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import AsyncIterator
 
@@ -11,10 +12,13 @@ from app.models.entities import ConversationEvent
 from app.repositories.life_service import OperationLogRepository
 from app.schemas.api import ChatRequest, EdgeContextPacket
 from app.services.context import ServiceContextBuilder
+from app.services.conversation_memory import build_agent_context
 from app.services.error_recovery import ErrorRecoveryService
 from app.services.fulfillment_agent import FulfillmentAgent
 from app.services.llm import LLMService
 from app.services.sessions import SessionStore
+
+logger = logging.getLogger(__name__)
 
 
 class ChatOrchestrator:
@@ -77,6 +81,8 @@ class ChatOrchestrator:
         yield "pipeline", pipeline_payload()
 
         agent_result = None
+        streamed_reply = ""
+        reply_stream_started = False
         try:
             async for event, payload in self.agent.run_stream(
                 db,
@@ -96,7 +102,8 @@ class ChatOrchestrator:
                     step(
                         "intent_detect",
                         f"[{intent_meta.get('route_category', '?')}] {intent} "
-                        f"({int((intent_meta.get('confidence') or 0) * 100)}%, agent)",
+                        f"({int((intent_meta.get('confidence') or 0) * 100)}%, "
+                        f"{intent_meta.get('turn_mode', 'full')}, agent)",
                     )
                     titles = payload.get("knowledge_titles") or []
                     step("knowledge_search", ", ".join(titles[:3]) if titles else "按需 search_knowledge")
@@ -117,6 +124,8 @@ class ChatOrchestrator:
                     yield "pipeline", pipeline_payload()
                 elif event == "thinking":
                     yield "thinking", payload
+                elif event == "thinking_token":
+                    yield "thinking_token", payload
                 elif event == "reply_reset":
                     yield "reply_reset", payload
                 elif event == "agent":
@@ -131,11 +140,65 @@ class ChatOrchestrator:
                     step("tool_action", f"{payload.get('tool_count', 0)} calls via ReAct")
                     yield "pipeline", pipeline_payload()
                 elif event == "token":
+                    reply_stream_started = True
+                    streamed_reply += str(payload.get("text") or "")
                     yield "token", payload
                 elif event == "result":
                     agent_result = payload
                     agent_finish = agent_result.finish.to_dict()
         except Exception as exc:
+            logger.exception("agent.run_stream failed after_stream=%s", reply_stream_started)
+            if reply_stream_started and streamed_reply.strip():
+                step("post_stream_error", str(exc)[:120], status="warning")
+                yield "pipeline", pipeline_payload()
+                reply = streamed_reply.strip()
+                step("model_response", f"partial {round(time.perf_counter() - started, 2)}s")
+                pipeline["model"] = {"mode": self.llm.mode, "latency_s": round(time.perf_counter() - started, 2)}
+                if agent_result is not None:
+                    try:
+                        await store.set_agent_context(session_id, build_agent_context(agent_result))
+                    except Exception:
+                        logger.exception("set_agent_context failed in orchestrator fallback")
+                try:
+                    await self._persist_turn(
+                        db,
+                        store,
+                        session_id=session_id,
+                        user_id=user_id,
+                        body=body,
+                        edge=edge,
+                        reply=reply,
+                        intent=intent,
+                        intent_meta=intent_meta,
+                        focus_order_id=focus_order_id,
+                        agent_trace=agent_trace,
+                        agent_finish=agent_finish if agent_result else {},
+                        tool_calls=agent_result.tool_calls if agent_result else [],
+                        pipeline=pipeline,
+                        workflow_payload=agent_result.workflow_payload if agent_result else None,
+                    )
+                except Exception as persist_exc:
+                    logger.exception("persist partial turn failed: %s", persist_exc)
+                yield "done", {
+                    "session_id": session_id,
+                    "reply": reply,
+                    "intent": intent,
+                    "intent_meta": intent_meta,
+                    "pipeline": pipeline,
+                    "service_cards": self._cards(service_context),
+                    "tool_calls": agent_result.tool_calls if agent_result else [],
+                    "workflow": workflow_payload,
+                    "case": workflow_payload,
+                    "focus_order_id": focus_order_id,
+                    "agent_trace": agent_trace,
+                    "agent_finish": agent_finish if agent_result else {},
+                    "pending_confirmations": (
+                        [p.to_dict() for p in agent_result.pending_confirmations] if agent_result else []
+                    ),
+                    "partial_success": True,
+                }
+                return
+
             step("error_recovery", str(exc)[:120], status="warning")
             yield "pipeline", pipeline_payload()
             async for event, payload in self.recovery.recover_stream(
@@ -145,6 +208,7 @@ class ChatOrchestrator:
                 history=history,
                 session_id=session_id,
                 partial_trace=agent_trace,
+                emit_thinking=not reply_stream_started,
             ):
                 if event == "thinking":
                     yield "thinking", payload
@@ -181,29 +245,38 @@ class ChatOrchestrator:
         tool_calls = agent_result.tool_calls
         focus_order_id = agent_result.focus_order_id or focus_order_id
         workflow_payload = agent_result.workflow_payload
+        agent_finish = agent_result.finish.to_dict()
+
+        try:
+            await store.set_agent_context(session_id, build_agent_context(agent_result))
+        except Exception:
+            logger.exception("set_agent_context failed session=%s", session_id)
 
         step("model_response", f"{self.llm.mode} {agent_result.reply_source} {round(time.perf_counter() - started, 2)}s")
 
         reply = agent_result.finish.draft_message
         pipeline["model"] = {"mode": self.llm.mode, "latency_s": round(time.perf_counter() - started, 2)}
 
-        await self._persist_turn(
-            db,
-            store,
-            session_id=session_id,
-            user_id=user_id,
-            body=body,
-            edge=edge,
-            reply=reply,
-            intent=intent,
-            intent_meta=intent_meta,
-            focus_order_id=focus_order_id,
-            agent_trace=agent_trace,
-            agent_finish=agent_finish,
-            tool_calls=tool_calls,
-            pipeline=pipeline,
-            workflow_payload=workflow_payload,
-        )
+        try:
+            await self._persist_turn(
+                db,
+                store,
+                session_id=session_id,
+                user_id=user_id,
+                body=body,
+                edge=edge,
+                reply=reply,
+                intent=intent,
+                intent_meta=intent_meta,
+                focus_order_id=focus_order_id,
+                agent_trace=agent_trace,
+                agent_finish=agent_finish,
+                tool_calls=tool_calls,
+                pipeline=pipeline,
+                workflow_payload=workflow_payload,
+            )
+        except Exception:
+            logger.exception("persist turn failed session=%s", session_id)
 
         yield "done", {
             "session_id": session_id,
@@ -271,16 +344,18 @@ class ChatOrchestrator:
         )
 
         if workflow_payload:
+            case_id = workflow_payload.get("case_id") if isinstance(workflow_payload, dict) else None
             await self._operation_log(
                 db,
                 session_id,
                 user_id,
                 "diagnose",
                 "agent",
-                f"Agent 采纳 Case {workflow_payload.get('case_id')}",
+                f"Agent 采纳 Case {case_id}",
                 workflow_payload,
             )
 
+        wf_case_id = workflow_payload.get("case_id") if isinstance(workflow_payload, dict) else None
         await self._operation_log(
             db,
             session_id,
@@ -288,7 +363,7 @@ class ChatOrchestrator:
             "reply",
             "agent",
             reply[:120],
-            {"intent": intent, "case_id": workflow_payload.get("case_id") if workflow_payload else None},
+            {"intent": intent, "case_id": wf_case_id},
         )
 
     async def run_once(self, db: AsyncSession, store: SessionStore, body: ChatRequest) -> dict:

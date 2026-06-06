@@ -36,3 +36,18 @@ class SessionStore:
             text = item.decode() if isinstance(item, bytes) else item
             messages.append(json.loads(text))
         return messages
+
+    async def get_agent_context(self, session_id: str) -> dict | None:
+        raw = await self.redis.get(f"agent_ctx:{session_id}")
+        if not raw:
+            return None
+        text = raw.decode() if isinstance(raw, bytes) else raw
+        try:
+            data = json.loads(text)
+            return data if isinstance(data, dict) else None
+        except json.JSONDecodeError:
+            return None
+
+    async def set_agent_context(self, session_id: str, ctx: dict) -> None:
+        key = f"agent_ctx:{session_id}"
+        await self.redis.setex(key, self.ttl, json.dumps(ctx, ensure_ascii=False))

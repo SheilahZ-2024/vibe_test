@@ -16,6 +16,7 @@ from app.repositories.life_service import (
 from app.diagnosis import DiagnosisContext, DiagnosisEngine
 from app.diagnosis.types import CaseDiagnosisResult
 from app.services.serializers import model_dict
+from app.services.tool_payloads import normalize_query_voucher, voucher_from_payload
 
 
 class LifeServiceTools:
@@ -192,14 +193,20 @@ class LifeServiceTools:
             vouchers = [voucher] if voucher else []
         else:
             vouchers = await self.vouchers.list_for_user(db, user_id)
-        return {
-            "count": len(vouchers),
-            "vouchers": [
-                model_dict(v, ["id", "order_id", "store_id", "code", "title", "status", "valid_to", "usage_rule"])
-                for v in vouchers
-                if v
-            ],
-        }
+        rows = [
+            model_dict(v, ["id", "order_id", "store_id", "code", "title", "status", "valid_to", "usage_rule"])
+            for v in vouchers
+            if v
+        ]
+        primary = rows[0] if len(rows) == 1 else None
+        return normalize_query_voucher(
+            {
+                "count": len(rows),
+                "vouchers": rows,
+                "voucher": primary,
+                "found": bool(rows),
+            }
+        )
 
     async def query_coupon(self, db: AsyncSession, user_id: str) -> dict:
         coupons = await self.coupons.list_for_user(db, user_id)

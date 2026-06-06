@@ -7,10 +7,12 @@ from app.diagnosis.storybook import oral_expression_guidance
 from app.services.agent_state import AgentState, AgentTraceStep
 from app.services.context import context_summary_for_agent
 from app.services.diagnosis_rules import prompt_rules_block, should_include_oral_guidance
+from app.services.conversation_memory import format_memory_block
+from app.services.fact_sheet import build_fact_sheet, format_fact_sheet_block
 from app.services.intent import IntentResult
 from app.services.tool_catalog import tool_catalog_block
 
-AGENT_MISSION = """你是抖音生活服务 AI 履约服务管家，通过 ReAct（思考→行动→观察）自主决策。
+AGENT_MISSION = """你是抖音生活服务 AI 履约服务管家，可以 思考→行动→观察 自主决策。
 原则：双轨参考（规则层+诊断脚本）并行、你综合裁决；信息不足/多订单未聚焦→finish clarify；
 写操作须用户确认；禁止编造数据、盲信任一侧、未聚焦擅自选单。
 效率：尽量 2-4 步内 finish；已有 query 结果勿重复调用相同工具；finish 时 draft_message 写完整用户回复。
@@ -25,7 +27,8 @@ REACT_OUTPUT_SCHEMA = """输出一个 JSON（无 markdown）：
 action=finish 时 finish 必填；写操作 pending 时用 suggested_actions（最多4个）。"""
 
 REACT_CONTINUATION_HEADER = """继续 ReAct，输出下一步 JSON（格式同上）。
-事实已足够则 action=finish 并写好 draft_message；勿重复相同 query。"""
+事实已足够则 action=finish 并写好 draft_message；勿重复相同 query。
+接话程序性追问（怎么预约/电话/地址/营业时间）：fact_sheet 已有门店电话或 supports_reservation 时直接 finish，禁止 human_handoff/search_knowledge。"""
 
 
 def build_react_system_prompt(state: AgentState, history: list[dict], *, step_idx: int = 1) -> str:
@@ -42,6 +45,28 @@ def build_react_system_prompt(state: AgentState, history: list[dict], *, step_id
     if state.prefetch_done:
         prefetch_note = "\n── 预取 ──\nquery_focus_bundle 已在 ReAct 前执行，勿重复；可直接 run_diagnosis / search_knowledge / finish。\n"
 
+    prior_block = ""
+    if state.prior_agent_ctx and state.intent_result.turn_mode == "continuation":
+        prior_block = f"""
+── 上一轮会话记忆（接话轮次，优先复用）──
+{format_memory_block(state.prior_agent_ctx)}
+程序性追问（怎么预约/电话/地址）：预取 fact_sheet 已含门店信息时直接 finish，勿 human_handoff。
+"""
+
+    fact_sheet = build_fact_sheet(
+        service_context=state.service_context,
+        tool_calls=state.tool_calls,
+        diagnosis_advisories=state.diagnosis_advisories,
+        focus_order_id=state.focus_order_id,
+    )
+    fact_block = format_fact_sheet_block(fact_sheet)
+    facts_section = ""
+    if fact_block and fact_block != "（尚无结构化事实）":
+        facts_section = f"""
+── 已核实事实（禁止违背）──
+{fact_block}
+"""
+
     return f"""{AGENT_MISSION}
 
 {REACT_OUTPUT_SCHEMA}
@@ -50,7 +75,7 @@ def build_react_system_prompt(state: AgentState, history: list[dict], *, step_id
 {_intent_guidance(intent)}
 {oral_block}
 {rules}
-{prefetch_note}
+{prefetch_note}{prior_block}{facts_section}
 ── 可用工具 ──
 {tool_catalog_block(intent=intent.route_intent, exclude=state.executed_tools)}
 
@@ -93,7 +118,7 @@ def _build_react_continuation_prompt(state: AgentState) -> str:
 """
 
 
-def build_final_reply_prompt(state: AgentState, finish: dict) -> str:
+def build_final_reply_prompt(state: AgentState, finish: dict, *, fact_block: str = "") -> str:
     """终轮润色 Prompt（仅在 ReAct 未产出足够 draft 时使用，尽量短）。"""
     mode = finish.get("mode", "reply")
     mode_hint = (
@@ -109,13 +134,14 @@ def build_final_reply_prompt(state: AgentState, finish: dict) -> str:
 
     tools = _compact_tool_results(state.tool_calls)
     latest_script = _diagnosis_script_block(state.diagnosis_advisories, compact=True)
+    facts_section = f"\n── 已核实事实（禁止违背）──\n{fact_block}\n" if fact_block.strip() else ""
 
     return f"""{AGENT_MISSION}
 {mode_hint}
 
 意图：{state.intent_result.route_intent}
 聚焦：{state.focus_order_id or "未聚焦"}
-
+{facts_section}
 ── 推理摘要 ──
 {_trace_block(state.trace, max_steps=4)}
 

@@ -70,17 +70,17 @@ class Settings(BaseSettings):
 
     agent_tone_polish_enabled: bool = Field(default=True, validation_alias=AliasChoices("AGENT_TONE_POLISH_ENABLED"))
     agent_tone_polish_temperature: float = Field(
-        default=0.72,
+        default=0.55,
         validation_alias=AliasChoices("AGENT_TONE_POLISH_TEMPERATURE"),
     )
-    agent_tone_polish_max_tokens: int = Field(default=384, validation_alias=AliasChoices("AGENT_TONE_POLISH_MAX_TOKENS"))
+    agent_tone_polish_max_tokens: int = Field(default=280, validation_alias=AliasChoices("AGENT_TONE_POLISH_MAX_TOKENS"))
     agent_tone_polish_min_chars: int = Field(default=8, validation_alias=AliasChoices("AGENT_TONE_POLISH_MIN_CHARS"))
     agent_parallel_intent_knowledge: bool = Field(
         default=False,
         validation_alias=AliasChoices("AGENT_PARALLEL_INTENT_KNOWLEDGE"),
     )
     agent_early_draft_stream: bool = Field(
-        default=True,
+        default=False,
         validation_alias=AliasChoices("AGENT_EARLY_DRAFT_STREAM"),
     )
     agent_prefetch_focus_bundle: bool = Field(
@@ -88,7 +88,7 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("AGENT_PREFETCH_FOCUS_BUNDLE"),
     )
     agent_react_stream_json: bool = Field(
-        default=True,
+        default=False,
         validation_alias=AliasChoices("AGENT_REACT_STREAM_JSON"),
     )
     agent_coalesce_focus_reads: bool = Field(
@@ -98,6 +98,10 @@ class Settings(BaseSettings):
     agent_hide_atomic_focus_reads: bool = Field(
         default=True,
         validation_alias=AliasChoices("AGENT_HIDE_ATOMIC_FOCUS_READS"),
+    )
+    agent_fast_turn_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("AGENT_FAST_TURN_ENABLED"),
     )
 
     error_recovery_use_llm: bool = Field(default=True, validation_alias=AliasChoices("ERROR_RECOVERY_USE_LLM"))

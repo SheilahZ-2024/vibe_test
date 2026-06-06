@@ -9,7 +9,7 @@ import { PhoneShell } from "./components/PhoneShell";
 import { PlusMenu, type PlusMenuTarget } from "./components/PlusMenu";
 import { PrivacySettings } from "./components/PrivacySettings";
 import { ThinkingStream } from "./components/ThinkingStream";
-import { appendThinkingLine, formatThinkingDisplay } from "./lib/thinking";
+import { THINKING_PLACEHOLDER } from "./lib/thinking";
 import { reservationLabel } from "./lib/reservation";
 import { getStoredFocusOrderId, resolveFocusOrderId, setStoredFocusOrderId } from "./lib/orderFocus";
 import { getStoredUserId, resolveUserId, setStoredUserId } from "./lib/userSession";
@@ -68,7 +68,7 @@ export default function App() {
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
   const [streamPhase, setStreamPhase] = useState<"idle" | "observing" | "replying">("idle");
-  const [thinkingLines, setThinkingLines] = useState<string[]>([]);
+  const [thinkingText, setThinkingText] = useState("");
   const [workflow, setWorkflow] = useState<WorkflowDiagnosis | null>(null);
   const [serviceRecords, setServiceRecords] = useState<ServiceRecord[]>([]);
   const [timelineStages, setTimelineStages] = useState<TimelineStage[]>([]);
@@ -79,6 +79,7 @@ export default function App() {
   const [verificationCodeVersion, setVerificationCodeVersion] = useState(1);
   const [error, setError] = useState<string | null>(null);
   const [llmMode, setLlmMode] = useState("—");
+  const thinkingPlaceholderRef = useRef(false);
 
   useEffect(() => {
     localStorage.setItem("douyin-life-settings", JSON.stringify(settings));
@@ -266,7 +267,8 @@ export default function App() {
       setMessages((items) => [...items, { id: uid(), role: "user", content }]);
       setStreaming(true);
       setStreamPhase("observing");
-      setThinkingLines([]);
+      thinkingPlaceholderRef.current = true;
+      setThinkingText(THINKING_PLACEHOLDER);
       setWorkflow(null);
 
       const assistantId = uid();
@@ -275,7 +277,7 @@ export default function App() {
       try {
         await streamChat(sid, content, edge, {
           onPipeline: (payload) => {
-            const steps = payload.pipeline.steps ?? [];
+            const steps = payload.pipeline?.steps ?? [];
             if (steps.some((s) => s.name === "agent_react" || s.name === "agent_decision")) {
               setStreamPhase("observing");
             }
@@ -288,8 +290,26 @@ export default function App() {
           },
           onThinking: (payload) => {
             if (payload.line) {
-              setThinkingLines((prev) => appendThinkingLine(prev, payload.line!));
+              setThinkingText((prev) => {
+                const line = payload.line!.trim();
+                if (!line) return prev;
+                if (thinkingPlaceholderRef.current) {
+                  thinkingPlaceholderRef.current = false;
+                  return line;
+                }
+                return prev ? `${prev}\n${line}` : line;
+              });
             }
+            setStreamPhase("observing");
+          },
+          onThinkingToken: (token) => {
+            setThinkingText((prev) => {
+              if (thinkingPlaceholderRef.current) {
+                thinkingPlaceholderRef.current = false;
+                return token;
+              }
+              return prev + token;
+            });
             setStreamPhase("observing");
           },
           onToken: (token) => {
@@ -300,16 +320,10 @@ export default function App() {
               return [...rest, { id: assistantId, role: "assistant", content: reply }];
             });
           },
-          onReplyReset: () => {
-            reply = "";
-            setMessages((items) => {
-              const rest = items.filter((item) => item.id !== assistantId);
-              return [...rest, { id: assistantId, role: "assistant", content: "" }];
-            });
-          },
           onDone: (data) => {
             setStreamPhase("idle");
-            setThinkingLines([]);
+            thinkingPlaceholderRef.current = false;
+            setThinkingText("");
             setServiceCards((data.service_cards ?? []) as ServiceCard[]);
             syncFocusFromServer(data.focus_order_id as string | undefined);
             if (data.workflow || data.case) {
@@ -341,10 +355,13 @@ export default function App() {
             });
           },
           onError: (err) => {
+            thinkingPlaceholderRef.current = false;
+            setThinkingText("");
             setError(err.message);
           },
         });
       } finally {
+        thinkingPlaceholderRef.current = false;
         setStreaming(false);
         setStreamPhase("idle");
       }
@@ -435,8 +452,8 @@ export default function App() {
     }
   };
 
-  const thinkingNarrative = formatThinkingDisplay(thinkingLines, streaming && streamPhase === "observing");
-  const showThinking = streaming && streamPhase === "observing";
+  const showThinking = streaming && thinkingText.trim().length > 0;
+  const thinkingCompact = streamPhase === "replying";
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-slate-200 px-3 py-4 text-slate-950">
@@ -481,8 +498,9 @@ export default function App() {
           input={input}
           error={error}
           workflow={workflow}
-          thinkingNarrative={thinkingNarrative}
+          thinkingNarrative={thinkingText}
           showThinking={showThinking}
+          thinkingCompact={thinkingCompact}
           plusOpen={plusOpen}
           verificationCodeVersion={verificationCodeVersion}
           onInput={setInput}
@@ -552,6 +570,7 @@ function ConversationView({
   workflow,
   thinkingNarrative,
   showThinking,
+  thinkingCompact,
   plusOpen,
   verificationCodeVersion,
   onInput,
@@ -572,6 +591,7 @@ function ConversationView({
   workflow: WorkflowDiagnosis | null;
   thinkingNarrative: string;
   showThinking: boolean;
+  thinkingCompact: boolean;
   plusOpen: boolean;
   verificationCodeVersion: number;
   onInput: (value: string) => void;
@@ -621,15 +641,17 @@ function ConversationView({
             </div>
           ))}
 
-          {showThinking && <ThinkingStream text={thinkingNarrative} active />}
+          {showThinking && (
+            <ThinkingStream text={thinkingNarrative} active={streaming && !thinkingCompact} compact={thinkingCompact} />
+          )}
 
-          {streamingAssistant && (
+          {streamingAssistant && streamingAssistant.content ? (
             <div className="flex justify-start">
               <div className="max-w-[88%] rounded-2xl bg-white px-3 py-2 text-sm leading-relaxed text-slate-900 shadow-sm">
-                {streamingAssistant.content || "…"}
+                {streamingAssistant.content}
               </div>
             </div>
-          )}
+          ) : null}
 
           {!streaming && solutions.length > 0 && (
             <SolutionChips solutions={solutions} onSend={onSend} onWorkflowAction={onWorkflowAction} />

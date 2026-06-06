@@ -14,6 +14,7 @@ from app.services.agent_state import AgentState, PendingWriteAction
 from app.services.error_recovery import tool_error_payload
 from app.config import settings
 from app.services.tool_catalog import TOOL_CATALOG, TOOL_TO_ACTION_ID, WRITE_ACTION_TITLES, WRITE_TOOLS
+from app.services.tool_payloads import normalize_focus_bundle, normalize_query_voucher
 from app.services.tools import LifeServiceTools
 
 _ATOMIC_FOCUS_READS = frozenset({"query_order", "query_voucher", "query_store"})
@@ -143,7 +144,7 @@ class AgentToolExecutor:
                 match = next((v for v in vouchers if str(v.get("order_id")) == str(order_id)), None)
                 voucher_id = match.get("id") if match else None
             result = await self.tools.query_voucher(db, user_id, str(voucher_id) if voucher_id else None)
-            return _compact({"ok": True, **result})
+            return _compact(normalize_query_voucher({"ok": True, **result}))
 
         if tool_name == "query_store":
             result = await self.tools.query_store(db, user_id, str(focus))
@@ -163,13 +164,15 @@ class AgentToolExecutor:
             )
             if order_res.get("found") and order_res.get("order"):
                 state.focus_order_id = str(order_res["order"].get("id") or order_id)
-            bundle = {
-                "ok": True,
-                "parallel": True,
-                "order": order_res,
-                "voucher": voucher_res,
-                "store": store_res,
-            }
+            bundle = normalize_focus_bundle(
+                {
+                    "ok": True,
+                    "parallel": True,
+                    "order": order_res,
+                    "voucher": voucher_res,
+                    "store": store_res,
+                }
+            )
             state.focus_bundle_cache = bundle
             state.executed_tools.update(_ATOMIC_FOCUS_READS)
             state.executed_tools.add("query_focus_bundle")

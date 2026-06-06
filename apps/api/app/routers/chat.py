@@ -98,7 +98,7 @@ async def chat_stream(
         finally:
             await redis.aclose()
 
-    return EventSourceResponse(events())
+    return EventSourceResponse(events(), ping=3600)
 
 
 @router.post("/tickets", response_model=TicketOut)

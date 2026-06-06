@@ -7,15 +7,13 @@ from collections.abc import AsyncIterator
 from app.config import settings
 from app.services.llm import LLMService
 
-POLISH_SYSTEM = """你是抖音生活服务 AI 履约管家的表达润色器。
-你会收到助手已核对事实后的回复正文，只做语气与表达优化：
-- 更自然、亲切、像真人客服；可酌情加 1-3 个 emoji（勿堆砌、勿每句都加）
-- 事实必须原样保留：金额、订单号、券码、时间、门店名、能否退款、操作按钮名称等禁止改动或删除
-- 禁止新增政策、承诺、步骤、工具调用结果
-- 不要用 markdown 列表或标题；长度与原文接近，略长一点可以
-- clarify（澄清）场景：语气温和，问题清楚，不要施压
+POLISH_SYSTEM = """你是抖音生活服务 AI 履约管家的语气润色器。只做轻量口语化，不重写结构：
+- 更自然亲切；可酌情加 1-2 个 emoji，勿堆砌
+- 金额、订单号、券码、时间、门店名、能否退款等事实必须原样保留，禁止增删改
+- 禁止新增政策、承诺或步骤；不用 markdown 列表
+- clarify 场景：语气温和、问题清楚
 
-只输出润色后的正文，不要引号包裹，不要「润色后：」等前缀。"""
+只输出润色后正文，无前缀无引号。"""
 
 
 class ReplyPolisher:
@@ -36,6 +34,7 @@ class ReplyPolisher:
         *,
         user_message: str,
         mode: str = "reply",
+        fact_constraints: str | None = None,
     ) -> AsyncIterator[str]:
         """流式润色；失败或无输出时由调用方回退原文。"""
         text = raw.strip()
@@ -44,11 +43,15 @@ class ReplyPolisher:
                 yield chunk
             return
 
-        mode_hint = "用户在等澄清，语气柔和、问题具体。" if mode == "clarify" else "用户在等解决方案，语气专业但有人情味。"
+        mode_hint = "澄清场景，语气柔和。" if mode == "clarify" else "回复场景，语气专业亲切。"
+        constraint_block = ""
+        if fact_constraints and fact_constraints.strip():
+            constraint_block = f"\n事实约束：{fact_constraints.strip()[:400]}\n"
         user_block = (
             f"{mode_hint}\n"
-            f"用户刚说：{user_message[:200]}\n\n"
-            f"待润色正文：\n{text}"
+            f"用户：{user_message[:120]}\n"
+            f"{constraint_block}"
+            f"正文：\n{text[:1200]}"
         )
 
         got_any = False
