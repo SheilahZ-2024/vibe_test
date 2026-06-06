@@ -14,8 +14,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.entities import AgentOperationLog, RefundCase, User
 
 BULK_SEED_MIN_USERS = 100
-# v4：seed 仅含应答流程事实字段，无 diagnosis_case / demo_scenario / hint
-BULK_SEED_VERSION = 4
+# v5：仅平台/商家/用户客观事实；无诊断捷径 metadata；时间由 mock_time_shift 在启动时对齐
+BULK_SEED_VERSION = 5
 MAX_REFUNDS_BEFORE_RESEED = 20
 
 

@@ -1,95 +1,103 @@
-# 抖音生活服务 AI履约服务管家
+# 抖音生活服务 · AI 履约服务管家
 
-面向抖音生活服务 C 端用户的 P0 Demo。它不是智能客服、AI 问答机器人、FAQ 系统或帮助中心，而是嵌入生活服务旅程的 **AI履约服务管家**。
+面向抖音生活服务 C 端用户的 **P0 Demo**。它不是 FAQ、智能客服或独立聊天机器人，而是嵌入履约旅程的 **AI 履约服务管家**——帮用户把「买了券 → 预约 → 到店 → 核销 → 售后」这件事做成。
 
-核心目标：帮助用户成功完成一次生活服务消费履约。
+**衡量标准**：用户问题有没有被解决，而不是模型回答是否漂亮。
+
+---
 
 ## 核心能力
 
-- 展示履约旅程：发现团购、购买、预约、到店、核销、售后。
-- 查询生活服务订单：团购套餐、电影票、预约服务。
-- 查看团购券：券码、有效期、核销状态、使用规则。
-- 诊断核销失败：查询订单、团购券、门店，给出可执行解决方案。
-- 解释优惠券：门槛、类目、叠加限制、不可用原因。
-- 售后退款：规则判断、创建退款申请、展示处理进度。
-- 门店履约：营业时间、地址、电话、预约/改约能力。
-- 转人工：创建服务工单并同步上下文。
+| 能力 | 说明 |
+|------|------|
+| **会话式履约服务** | 以对话为主界面，订单摘要、履约进度、服务卡片嵌入会话流 |
+| **SDS v1 诊断** | 73 Case 注册表 + 诊断树；根据订单/券/门店**客观事实**与用户话术推理 |
+| **ReAct 工具链** | 查单、查券、查门店、诊断、退款、转人工等能力全部走 Tool，结果可观测 |
+| **流式思考 + 回复** | 全中文思考叙述（不暴露 Case ID / Intent 术语）；SSE 流式输出 |
+| **履约可视化** | 服务进度时间线（购买→预约→到店→核销→售后）；操作记录含退款金额与到账状态 |
+| **120 用户 Mock 场** | 80 正常履约 + 9 售后 + 40 异常样本；**不预填**对话与操作记录，等用户来问 |
+| **实时 Mock 时间** | 规则判断用真实「现在」；API 启动时 `mock_time_shift` 将业务时间对齐当前时刻 |
 
-## 技术架构
+---
+
+## 设计亮点
+
+### 1. 数据层只放事实，诊断靠推理
+
+Mock 生成器（`scripts/generate_mock_data.py`）只写入平台/商家/用户侧可观测数据：
+
+- 订单状态、券有效期、`usage_rule` 文案、`can_refund`
+- 门店 POI（营业时间、`business_status`、搬迁旧址、POS 同步时间）
+- 履约事件、退款单记录
+
+**禁止**写入 `merchant_reject`、`store_mismatch`、`diagnosis_case` 等诊断捷径。跨店场景通过「订单门店 ≠ 券适用门店」等**关系事实**表达；拒核销等现场问题靠**用户描述 + 引擎规则**推导。
+
+### 2. 双层时间：规则实时 + 启动对齐
+
+- **引擎规则**（周末限定、午市、营业时段）按 `Asia/Shanghai` **当前时刻**计算
+- **Mock 业务时间**以 `SEED_ANCHOR` 为基准生成，每次 API 启动 `mock_time_shift` 整体平移到「现在」（±15 分钟抖动）
+- 前端状态栏时钟（`PhoneShell`）同步显示本机实时时间
+
+### 3. 思考区对用户友好
+
+`thinking_narrative.py` 将 pipeline / 工具调用翻译为「您可能是想咨询…」「正在帮您查订单…」等自然中文，过滤英文 intent 名与内部术语。
+
+### 4. 意图置信度门控
+
+轻量 LLM（或关键词兜底）先做意图分类；低于阈值走 `clarify` 澄清，避免误触发工具链。主回复 LLM 可配置 `LLM_REQUIRE_LIVE` 禁止静默 Mock。
+
+### 5. 可切换 Demo 用户
+
+顶部用户切换器在 120 个 mock 用户间切换；**user_081 ~ user_120** 为异常样本（跨店、过期、POS 不同步、门店闭店等），适合逐项体验诊断能力。
+
+---
+
+## 系统架构（概要）
 
 ```text
-apps/web          React + Vite + Tailwind，移动端履约服务管家体验
-apps/api          FastAPI，SSE 流式对话、业务工具、LLM 编排
-apps/api/app/diagnosis   SDS v1 诊断引擎（Case 注册表 / 诊断树 / 动作矩阵）
-deploy/init-db    PostgreSQL 领域 schema 与生活服务种子数据
-docker-compose    postgres + redis + api + web(nginx)
+┌─────────────┐     SSE      ┌──────────────────────────────────────┐
+│  apps/web   │ ◄──────────► │  apps/api (FastAPI)                  │
+│  React 会话 │   /stream    │  Orchestrator → Agent(ReAct) → Tools │
+│  BottomSheet│              │           ↘ DiagnosisEngine (SDS v1) │
+└─────────────┘              └──────────┬─────────────┬─────────────┘
+                                        │             │
+                                   PostgreSQL       Redis
+                                   (领域+知识库)    (会话)
 ```
 
-### SDS v1 诊断链路
+**一次对话路径**：用户输入 → EdgeContext（授权/焦点订单）→ 意图识别 → 拉取 service-context → 知识库检索 → ReAct 选工具 → 诊断树（若核销/售后类）→ Prompt 注入 Case + 动作 → LLM 流式解释。
 
-遵循《Service Diagnosis System v1》规范，每轮对话严格走：
+详细分层、模块表、数据流与 seed 机制见 **[docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md)**。
 
-```text
-Intent识别 → 上下文获取 → 诊断树执行 → Case生成 → 工具调用 → Prompt注入 → LLM解释
-```
-
-- **Case 体系**：73 个注册 Case（IC 10 + PC 15 + FC 20 + AC 10 + CC 15 + 系统 3）
-- **代码入口**：`apps/api/app/diagnosis/`（`case_specs` / `registry` / `engine` / `matrices` / `storybook`）
-- **Storybook**：SB-001 ~ SB-018 口语表达库，见 `storybook.py`
-- **种子数据**（`deploy/init-db/`，按文件名顺序执行）：
-  - `01-schema.sql` — 建表
-  - `02-knowledge-seed.sql` — **平台知识库唯一来源**（18 条 policy/refund/coupon 等）
-  - `03-bulk-seed.sql` — 120 用户 mock 业务数据（由 `scripts/generate_mock_data.py` 生成；**只写业务事实，不预写诊断结论**）
-  - `04`/`05` — 已废弃占位（Storybook 个案不再灌库）
-  - `02-seed.sql`、`06-knowledge-refine.sql` — 已合并至 `02-knowledge-seed.sql`
-
-### 前端体验（会话为主）
-
-- 主界面以**会话服务**为全屏主体；订单摘要与履约进度嵌入对话区域顶部
-- 输入框右侧 **+** 可打开：服务进度、历史订单、操作记录、授权设置（半屏 BottomSheet）
-- 流式回复前展示**自然语言思考过程**（不暴露 Case ID、Intent 等术语给用户）
-- 诊断完成后展示「您可以这样继续」动作 chips
+---
 
 ## 快速开始
 
 ### 依赖
 
-已在本机准备：
+- Docker Desktop（Running）
+- Git、Node 22、Python 3.12（本地开发可选）
 
-- Git 2.54
-- Docker Desktop 4.76（首次需要手动启动并完成 WSL2/协议向导）
-- Node.js 22
-- Python 3.12（后端 venv 使用 3.12）
-
-如果终端找不到 `git` 或 `docker`：
+终端找不到命令时：
 
 ```powershell
 cd C:\Users\15924\Projects\smart-assistant
 . .\scripts\refresh-path.ps1
 ```
 
-### 初始化依赖
+### 启动（推荐 Docker）
 
 ```powershell
 cd C:\Users\15924\Projects\smart-assistant
-.\scripts\setup.ps1
+copy .env.example .env   # 首次
+docker compose up --build -d
 ```
 
-### 启动全栈服务
-
-首次请先打开 Docker Desktop，确认状态为 Running。
-
-```powershell
-cd C:\Users\15924\Projects\smart-assistant
-copy .env.example .env
-docker compose up --build
-```
-
-如果之前启动过旧版 schema，请先重置本地数据库卷：
+从旧版数据库升级（会清空 Demo 数据并重灌 v5 seed）：
 
 ```powershell
 docker compose down -v
-docker compose up --build
+docker compose up --build -d
 ```
 
 | 服务 | 地址 |
@@ -98,122 +106,86 @@ docker compose up --build
 | API 文档 | http://localhost:8000/docs |
 | 健康检查 | http://localhost:8000/health |
 
-无 `LLM_API_KEY` 时，系统自动使用内置 Mock 模型，仍可完整演示业务链路。
+API 每次启动会自动：`migrate` → 知识库/bootstrap → bulk seed（版本落后时重灌）→ **mock 时间对齐**。
 
 ### 接入豆包（火山方舟）
-
-在 `.env` 中配置：
 
 ```env
 LLM_API_KEY=你的方舟API密钥
 LLM_BASE_URL=https://ark.cn-beijing.volces.com/api/v3
 LLM_MODEL=doubao-seed-1-8-251228
-LLM_TEMPERATURE=0.3
-LLM_MAX_TOKENS=1200
+LLM_REQUIRE_LIVE=true          # 对话主链路禁止静默 Mock
+LLM_FALLBACK_TO_MOCK=true      # 仅非主链路可降级
 ```
 
-注意：`LLM_MODEL` 填写豆包官网模型 ID（如 `doubao-seed-1-8-251228`）或方舟推理接入点 ID（`ep-` 开头）。
+### 本地体验建议
 
-### 意图识别（轻量 LLM + 置信度阈值）
+1. 打开 http://localhost:5173 ，切换不同 Demo 用户
+2. 正常用户：「查看券码」「我的订单到哪一步了」
+3. 异常用户（081+）：「扫不出来」「老板说不认券」「我要退款」「店关门了」
+4. 点击 **+** 查看服务进度、历史订单、操作记录
 
-对话链路会先做一次**轻量意图分类**（非主回复 LLM），再决定是否进入工具链：
-
-```env
-INTENT_CONFIDENCE_THRESHOLD=0.65   # 达到阈值才路由到业务意图
-INTENT_USE_LLM=true                # 有 API Key 时用 LLM；否则关键词兜底
-INTENT_LLM_TEMPERATURE=0.1
-INTENT_LLM_MAX_TOKENS=256
-```
-
-| 路由结果 | 行为 |
-|----------|------|
-| 置信度 ≥ 阈值 + 业务意图 | 调用对应工具链（查单/诊断/退款等） |
-| 置信度 < 阈值 | `clarify`：跳过工具，模型先澄清/探明需求 |
-| `chitchat` | 简短闲聊后引导回履约话题 |
-
-SSE `pipeline` / `done` 事件会附带 `intent_meta`（原始意图、置信度、来源、备选意图）。
-
-连通性测试：
-
-```powershell
-cd C:\Users\15924\Projects\smart-assistant\apps\api
-.\.venv\Scripts\python.exe -c "import asyncio; from app.services.llm import LLMService; print(asyncio.run(LLMService().ping()))"
-```
-
-或访问 `GET /health/llm/ping`。
+---
 
 ## API 概览
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | `/api/v1/chat/sessions` | 创建助手会话 |
+| POST | `/api/v1/chat/sessions` | 创建会话 |
 | POST | `/api/v1/chat/stream` | SSE 流式对话 |
-| GET | `/api/v1/users/{user_id}/service-context` | 读取用户生活服务上下文 |
-| GET | `/api/v1/orders/{order_id}` | 订单详情 |
-| GET | `/api/v1/vouchers/{voucher_id}` | 团购券详情 |
-| POST | `/api/v1/refunds` | 创建退款申请 |
-| POST | `/api/v1/chat/tickets` | 转人工工单 |
-| GET | `/health` | 健康检查 |
-| GET | `/health/llm/ping` | 模型连通性测试 |
-| GET | `/api/v1/users/{user_id}/fulfillment-events` | 履约事件列表 |
-| GET | `/api/v1/users/{user_id}/orders/{order_id}/fulfillment-timeline` | 订单履约时间线（购买→预约→到店→核销→售后） |
-| GET | `/api/v1/users/{user_id}/service-records` | 操作记录（含退款金额与到账状态） |
-| GET | `/api/v1/users/{user_id}/operation-logs` | 助手操作日志（会话产生，seed 不预填） |
+| GET | `/api/v1/users/{id}/service-context` | 用户履约上下文 |
+| GET | `/api/v1/users/{id}/orders/{oid}/fulfillment-timeline` | 履约时间线 |
+| GET | `/api/v1/users/{id}/service-records` | 操作记录（含退款） |
+| POST | `/api/v1/refunds` | 创建退款 |
+| POST | `/api/v1/workflow/actions` | 执行处置动作 |
 | GET | `/api/v1/diagnosis/cases` | Case 列表 |
-| GET | `/api/v1/diagnosis/cases/{case_id}` | Case 详情与推荐动作 |
-| GET | `/api/v1/diagnosis/stats` | Case 统计 |
-| POST | `/api/v1/workflow/actions` | 执行工作流处置动作 |
 
-## Storybook 测试话术
+完整列表见 Swagger：http://localhost:8000/docs
 
-| 用户说法 | 预期 Case |
+---
+
+## Mock 数据维护
+
+```powershell
+# 重新生成 SQL（改剧本/字段后）
+py -3.12 scripts/generate_mock_data.py
+
+# 手动对齐时间（通常 API 启动已自动执行）
+py -3.12 scripts/shift_mock_timestamps.py
+```
+
+Seed 文件：`deploy/init-db/03-bulk-seed.sql`（`bulk_seed_version=5`）。
+
+---
+
+## Storybook 批测（开发）
+
+| 用户说法 | 典型 Case |
 |----------|-----------|
 | 扫不出来 | FC-008 |
 | 老板不给用 | FC-006 |
 | 店关门了 | FC-001 |
 | 我要退款 | AC-001 / AC-002 |
 | 吃坏肚子 | CC-008（P0） |
-| 那个有点问题 | CLARIFY |
-| 付了钱没券 | PC-001 |
-
-批测（诊断引擎 + 可选 API）：
 
 ```powershell
 cd apps\api
-.\.venv\Scripts\python.exe scripts\batch_storybook_test.py
 .\.venv\Scripts\python.exe scripts\batch_storybook_test.py --api http://localhost:8000
 ```
 
-## 示例问题
-
-- 我买的火锅套餐还能用吗？
-- 券码在哪里？
-- 到店核销失败，扫不出来。
-- 优惠券为什么不能用？
-- 我要退款。
-- 这家店几点关门？
-- 帮我转人工。
-
-## P0 Demo 主故事线
-
-```text
-用户购买火锅套餐
-→ 查看订单
-→ 查看券码
-→ 到店消费
-→ 核销失败
-→ AI 自动诊断
-→ 重新生成核销码 / 联系商家 / 转人工
-→ 问题解决
-→ 消费完成
-```
+---
 
 ## 文档
 
-- [产品说明](./docs/PRODUCT.md)
-- [系统架构](./docs/ARCHITECTURE.md)
-- [阿里云部署](./docs/DEPLOY_ALIYUN.md)
+| 文档 | 内容 |
+|------|------|
+| [docs/DEMO_GUIDE.md](./docs/DEMO_GUIDE.md) | **Demo 样本编号对照与演示脚本** |
+| [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) | 系统架构详解（分层、对话流、SDS、seed、时间） |
+| [docs/PRODUCT.md](./docs/PRODUCT.md) | 产品原则与 Agent 定义 |
+| [docs/DEPLOY_ALIYUN.md](./docs/DEPLOY_ALIYUN.md) | 阿里云部署 |
 
-## GitHub
+---
 
-仓库地址：https://github.com/SheilahZ-2024/vibe_test
+## 仓库
+
+https://github.com/SheilahZ-2024/vibe_test

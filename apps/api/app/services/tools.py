@@ -183,7 +183,7 @@ class LifeServiceTools:
                     "metadata",
                 ],
             ),
-            "store": model_dict(store, ["store_name", "business_hours", "address", "phone", "metadata"]) if store else None,
+            "store": model_dict(store, ["id", "store_name", "business_hours", "address", "phone", "supports_reservation", "metadata"]) if store else None,
         }
 
     async def query_voucher(self, db: AsyncSession, user_id: str, voucher_id: str | None = None) -> dict:
@@ -195,7 +195,7 @@ class LifeServiceTools:
         return {
             "count": len(vouchers),
             "vouchers": [
-                model_dict(v, ["id", "order_id", "code", "title", "status", "valid_to", "usage_rule"])
+                model_dict(v, ["id", "order_id", "store_id", "code", "title", "status", "valid_to", "usage_rule"])
                 for v in vouchers
                 if v
             ],

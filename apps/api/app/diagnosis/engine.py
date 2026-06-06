@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 from app.diagnosis.matrices import resolve_actions
 from app.diagnosis.registry import CASE_REGISTRY, INTENT_TO_DEFAULT_CASE
 from app.diagnosis.types import CaseDiagnosisResult, DiagnosisContext, DiagnosisStep
+from app.services.store_facts import pos_sync_stale, store_relocated
+from app.services.usage_rules import requires_reservation, voucher_allowed_at, within_store_hours
 
 
 def _meta(obj: dict | None) -> dict:
@@ -36,6 +38,21 @@ def _now() -> datetime:
 def _has_reservation(order: dict | None) -> bool:
     meta = _meta(order)
     return bool(meta.get("reservation_confirmed") or meta.get("appointment"))
+
+
+def _needs_reservation(ctx: DiagnosisContext) -> bool:
+    o, v, s = ctx.order, ctx.voucher, ctx.store or {}
+    if not o or not v:
+        return False
+    sm = _meta(s)
+    supports = bool(s.get("supports_reservation") or sm.get("supports_reservation"))
+    return requires_reservation(str(v.get("usage_rule") or ""), str(o.get("service_type") or ""), supports)
+
+
+def _store_hours_ctx(store: dict | None) -> tuple[str, str | None]:
+    sm = _meta(store)
+    hours = str((store or {}).get("business_hours") or sm.get("business_hours") or "")
+    return hours, sm.get("today_hours") if isinstance(sm.get("today_hours"), str) else None
 
 
 class DiagnosisEngine:
@@ -107,14 +124,14 @@ class DiagnosisEngine:
 
     def _diagnose_query_store(self, ctx: DiagnosisContext) -> CaseDiagnosisResult:
         sm = _meta(ctx.store)
-        if sm.get("relocated") or "搬" in ctx.message:
+        if store_relocated(sm) or "搬" in ctx.message:
             return self._from_case("FC-003", "QueryStore", ctx, [DiagnosisStep(1, "门店", "warning", "门店已搬迁")], "high")
-        if sm.get("phone_unreachable") or "打不通" in ctx.message:
+        if "打不通" in ctx.message:
             return self._from_case("FC-004", "QueryStore", ctx, [DiagnosisStep(1, "联系", "fail", "电话无法接通")], "medium")
         return self._from_case("IC-008", "QueryStore", ctx, [DiagnosisStep(1, "门店信息", "pass", "查询营业信息")], "high")
 
     def _diagnose_query_reservation(self, ctx: DiagnosisContext) -> CaseDiagnosisResult:
-        if _meta(ctx.order).get("reservation_required") and not _has_reservation(ctx.order):
+        if _needs_reservation(ctx) and not _has_reservation(ctx.order):
             return self._from_case("PC-010", "QueryReservation", ctx, [DiagnosisStep(1, "预约", "fail", "未预约")], "high")
         return self._from_case("IC-009", "QueryReservation", ctx, [DiagnosisStep(1, "预约", "pass", "查询预约状态")], "high")
 
@@ -140,6 +157,9 @@ class DiagnosisEngine:
             return self._from_case("AC-002", "RefundRequest", ctx, steps, "high")
         if o.get("status") == "refunding":
             return self._from_case("AC-004", "RefundRequest", ctx, [DiagnosisStep(2, "退款", "pass", "处理中")], "high")
+        rule = str((ctx.voucher or {}).get("usage_rule") or "")
+        if not o.get("can_refund") and any(k in rule for k in ("不可退", "特价", "不支持退")):
+            return self._from_case("AC-010", "RefundRequest", ctx, [DiagnosisStep(2, "商品规则", "fail", "特价不退")], "high")
         if _meta(o).get("special_after_sale"):
             return self._from_case("AC-010", "RefundRequest", ctx, [DiagnosisStep(2, "特殊售后", "warning", "需人工审核")], "medium")
         return self._from_case("AC-002", "RefundRequest", ctx, [DiagnosisStep(2, "退款规则", "fail", "不支持自助退")], "medium")
@@ -227,20 +247,21 @@ class DiagnosisEngine:
             return self._from_case("PC-006", "VoucherUnavailable", ctx, steps, "high")
         steps.append(DiagnosisStep(4, "券核销", "pass", v.get("status", "")))
 
-        om, vm, sm = _meta(o), _meta(v), _meta(s)
-        if om.get("store_mismatch") or vm.get("store_mismatch"):
-            steps.append(DiagnosisStep(5, "门店匹配", "fail", "不适用", "VoucherStoreMismatch", "PC-008"))
+        om, sm = _meta(o), _meta(s)
+        order_store = o.get("store_id")
+        voucher_store = v.get("store_id")
+        if order_store and voucher_store and str(order_store) != str(voucher_store):
+            steps.append(DiagnosisStep(5, "门店匹配", "fail", "券适用门店与当前门店不一致", "VoucherStoreMismatch", "PC-008"))
             return self._from_case("PC-008", "VoucherUnavailable", ctx, steps, "high")
         steps.append(DiagnosisStep(5, "门店匹配", "pass", "ok"))
 
-        time_limited = om.get("time_restricted") or vm.get("time_restricted")
-        allowed_now = om.get("allowed_now") if om.get("time_restricted") else vm.get("allowed_now")
-        if time_limited and allowed_now is False:
-            steps.append(DiagnosisStep(6, "时段规则", "fail", "当前时段不可用", "VoucherTimeMismatch", "PC-009"))
+        allowed, time_detail = voucher_allowed_at(str(v.get("usage_rule") or ""))
+        if not allowed:
+            steps.append(DiagnosisStep(6, "时段规则", "fail", time_detail, "VoucherTimeMismatch", "PC-009"))
             return self._from_case("PC-009", "VoucherUnavailable", ctx, steps, "high")
         steps.append(DiagnosisStep(6, "时段规则", "pass", "ok"))
 
-        if om.get("reservation_required") and not _has_reservation(o):
+        if _needs_reservation(ctx) and not _has_reservation(o):
             steps.append(DiagnosisStep(7, "预约", "fail", "需预约", "ReservationMissing", "PC-010"))
             return self._from_case("PC-010", "VoucherUnavailable", ctx, steps, "high")
         steps.append(DiagnosisStep(7, "预约", "pass", "ok"))
@@ -252,14 +273,13 @@ class DiagnosisEngine:
         if biz in ("suspended", "closed"):
             steps.append(DiagnosisStep(8, "门店营业", "fail", "暂停营业", "StoreSuspended", "FC-001"))
             return self._from_case("FC-001", "VoucherUnavailable", ctx, steps, "high")
-        if sm.get("early_closure"):
-            steps.append(DiagnosisStep(8, "门店营业", "fail", "提前结束营业", "EarlyClosure", "FC-019"))
+        hours, today_hours = _store_hours_ctx(s)
+        open_now, hour_detail = within_store_hours(hours, today_hours=today_hours)
+        if not open_now:
+            steps.append(DiagnosisStep(8, "门店营业", "fail", hour_detail, "EarlyClosure", "FC-019"))
             return self._from_case("FC-019", "VoucherUnavailable", ctx, steps, "high")
         steps.append(DiagnosisStep(8, "门店营业", "pass", "ok"))
 
-        if sm.get("merchant_reject") or om.get("merchant_reject"):
-            steps.append(DiagnosisStep(9, "商家接待", "fail", "拒绝核销", "MerchantRejectService", "FC-006"))
-            return self._from_case("FC-006", "VoucherUnavailable", ctx, steps, "high")
         if any(k in ctx.message for k in ("老板不给", "不让用", "活动结束", "拒绝核销")):
             case = "FC-007" if "活动结束" in ctx.message else "FC-006"
             steps.append(DiagnosisStep(9, "商家接待", "fail", "用户描述拒核销", "MerchantRejectService", case))
@@ -269,11 +289,11 @@ class DiagnosisEngine:
         if v.get("status") == "frozen":
             steps.append(DiagnosisStep(10, "系统状态", "fail", "券冻结", "VoucherFrozen", "PC-007"))
             return self._from_case("PC-007", "VoucherUnavailable", ctx, steps, "high")
-        if om.get("qr_invalid") or vm.get("qr_invalid") or sm.get("scanner_synced") is False:
-            steps.append(DiagnosisStep(10, "系统状态", "warning", "扫码/二维码异常", "SystemVerificationFailed", "FC-008"))
+        if pos_sync_stale(sm) or any(k in ctx.message for k in ("扫不出来", "扫码失败", "刷不出来")):
+            steps.append(DiagnosisStep(10, "系统状态", "warning", "POS 同步异常或扫码失败", "SystemVerificationFailed", "FC-008"))
             return self._from_case("FC-008", "VoucherUnavailable", ctx, steps, "medium")
-        if om.get("campaign_ended"):
-            steps.append(DiagnosisStep(10, "活动", "fail", "活动结束", "CampaignEnded", "PC-015"))
+        if "活动结束" in ctx.message and v.get("status") not in ("expired", "used"):
+            steps.append(DiagnosisStep(10, "活动", "fail", "用户称活动结束", "CampaignEnded", "PC-015"))
             return self._from_case("PC-015", "VoucherUnavailable", ctx, steps, "high")
         steps.append(DiagnosisStep(10, "系统状态", "pass", "ok"))
         return self._from_case("FC-008", "VoucherUnavailable", ctx, steps, "low")
@@ -294,22 +314,24 @@ class DiagnosisEngine:
         for keys, case_id in checks:
             if any(k in msg for k in keys):
                 return self._from_case(case_id, intent, ctx, [DiagnosisStep(1, "履约异常", "fail", case_id)], "high")
-        if _meta(ctx.store).get("insufficient_capacity"):
-            return self._from_case("FC-020", intent, ctx, [DiagnosisStep(1, "容量", "fail", "履约能力不足")], "medium")
         return self._from_case("FC-011", intent, ctx, [DiagnosisStep(1, "履约", "warning", "服务不符")], "medium")
 
     def _diagnose_store_unavailable(self, ctx: DiagnosisContext) -> CaseDiagnosisResult:
         sm = _meta(ctx.store)
         msg = ctx.message
-        if sm.get("relocated") or "搬" in msg:
+        if store_relocated(sm) or "搬" in msg:
             return self._from_case("FC-003", "StoreUnavailable", ctx, [DiagnosisStep(1, "门店", "warning", "搬迁")], "high")
-        if sm.get("phone_unreachable") or "打不通" in msg:
+        if "打不通" in msg:
             return self._from_case("FC-004", "StoreUnavailable", ctx, [DiagnosisStep(1, "联系", "fail", "电话不通")], "medium")
-        if sm.get("over_capacity") or any(k in msg for k in ("排队", "等太久")):
+        if any(k in msg for k in ("排队", "等太久", "爆满")):
             return self._from_case("FC-005", "StoreUnavailable", ctx, [DiagnosisStep(1, "容量", "fail", "超负荷")], "medium")
         if sm.get("business_status") == "permanently_closed":
             return self._from_case("FC-002", "StoreUnavailable", ctx, [DiagnosisStep(1, "营业", "fail", "永久闭店")], "high")
-        return self._from_case("FC-001", "StoreUnavailable", ctx, [DiagnosisStep(1, "营业", "fail", "暂停营业")], "high")
+        hours, today_hours = _store_hours_ctx(ctx.store)
+        open_now, _ = within_store_hours(hours, today_hours=today_hours)
+        if not open_now or sm.get("business_status") in ("suspended", "closed"):
+            return self._from_case("FC-001", "StoreUnavailable", ctx, [DiagnosisStep(1, "营业", "fail", "暂停营业")], "high")
+        return self._from_case("FC-001", "StoreUnavailable", ctx, [DiagnosisStep(1, "营业", "pass", "查询门店")], "medium")
 
     def _diagnose_reservation_failure(self, ctx: DiagnosisContext) -> CaseDiagnosisResult:
         if any(k in ctx.message for k in ("不给约", "拒绝预约")):

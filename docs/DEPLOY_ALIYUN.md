@@ -113,9 +113,10 @@ cd ~/smart-assistant
 # 查看日志
 docker compose -f docker-compose.yml -f docker-compose.prod.yml logs -f web api
 
-# 更新代码后重新部署
+# 更新代码后重新部署（API 启动会自动 migrate + bulk seed v5 + 时间对齐）
 git pull
 docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+docker compose -f docker-compose.yml -f docker-compose.prod.yml restart api
 
 # 停止
 docker compose -f docker-compose.yml -f docker-compose.prod.yml down

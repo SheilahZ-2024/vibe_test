@@ -1,13 +1,11 @@
-"""Bulk mock 数据生成器（产出 deploy/init-db/03-bulk-seed.sql）。
+"""Bulk mock 数据生成器 → deploy/init-db/03-bulk-seed.sql
 
-本脚本只写入应答流程会查到的业务表字段（用户/门店/订单/券/优惠券/退款/履约事件），
-**不预写诊断结论**（无 Case ID、hint、agent_operation_logs、对话记录）。
+原则：
+- 只写入平台/商家/用户侧**客观事实**（订单状态、券规则文案、POI 营业状态、履约事件、退款记录等）
+- **禁止**诊断捷径标签（merchant_reject、store_mismatch、time_restricted 等）
+- 时间以 SEED_ANCHOR 为基准写入相对偏移；API 启动时 mock_time_shift 平移到真实「现在」
 
-诊断引擎在运行时根据上述事实 + 用户话术，走 SDS v1 诊断树得出 Case。
-字段对齐见 apps/api/app/diagnosis/engine.py 中 _meta() 合并后的 order/store metadata。
-
-重新生成：
-  python scripts/generate_mock_data.py
+重新生成：python scripts/generate_mock_data.py
 """
 
 from __future__ import annotations
@@ -20,6 +18,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "deploy" / "init-db" / "03-bulk-seed.sql"
 
+SEED_ANCHOR = datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+
 CITIES = ["北京", "上海", "广州", "深圳", "杭州", "成都", "武汉", "南京"]
 CATEGORIES = ["美食", "电影演出", "休闲娱乐", "丽人美发", "酒店民宿", "KTV", "运动健身"]
 MERCHANT_PREFIX = ["川巷子", "星河", "松间里", "悦食", "花间", "鹿鸣", "云栖", "青禾", "拾味", "暖居"]
@@ -27,9 +27,8 @@ SERVICE_TYPES = ["团购套餐", "电影票", "预约服务", "酒店套餐", "K
 COUPON_STATUSES = ["available", "unavailable", "used", "expired"]
 
 random.seed(42)
-NOW = datetime.now(timezone.utc)
+NOW = SEED_ANCHOR
 
-# 120 单 = 80 正常履约 + 9 售后 + 40 异常（等用户来问，不预填对话）
 NORMAL_PLAN: list[str] = (
     ["fresh_purchase"] * 20
     + ["scheduled_soon"] * 18
@@ -66,28 +65,18 @@ ANOMALY_PLAN: list[str] = [
 
 SCENARIO_PLAN: list[str] = NORMAL_PLAN + ANOMALY_PLAN
 
-# 仅含引擎/工具链会读的事实字段；suffix 仅用于门店展示名
+# suffix=展示名；其余字段均为可观测事实，非诊断结论
 ANOMALY_DEFS: dict[str, dict] = {
-    "anomaly_merchant_reject": {
-        "suffix": "·拒核销店",
-        "store_meta": {"merchant_reject": True, "scanner_synced": True},
-    },
-    "anomaly_merchant_campaign_end": {
-        "suffix": "·声称活动结束店",
-        "store_meta": {"merchant_reject": True},
-    },
-    "anomaly_merchant_reject_receive": {
-        "suffix": "·拒接待店",
-        "store_meta": {"merchant_reject": True},
-    },
+    "anomaly_merchant_reject": {"suffix": "·商圈店"},
+    "anomaly_merchant_campaign_end": {"suffix": "·活动门店"},
+    "anomaly_merchant_reject_receive": {"suffix": "·临街店"},
     "anomaly_scanner_unsynced": {
-        "suffix": "·扫码异常店",
-        "store_meta": {"scanner_synced": False},
+        "suffix": "·POS待同步店",
+        "store_meta": {"pos_last_sync_at": (NOW - timedelta(hours=72)).isoformat()},
     },
     "anomaly_qr_invalid": {
-        "suffix": "·二维码异常店",
-        "order_meta": {"qr_invalid": True},
-        "store_meta": {"scanner_synced": True},
+        "suffix": "·核销设备店",
+        "store_meta": {"pos_last_sync_at": (NOW - timedelta(hours=48)).isoformat()},
     },
     "anomaly_store_closed": {
         "suffix": "·暂停营业店",
@@ -98,64 +87,57 @@ ANOMALY_DEFS: dict[str, dict] = {
         "store_meta": {"business_status": "permanently_closed"},
     },
     "anomaly_store_relocated": {
-        "suffix": "·搬迁店",
-        "store_meta": {"relocated": True},
+        "suffix": "·搬迁新店",
+        "store_meta": {"previous_address": "示例路 88 号（旧址）"},
     },
-    "anomaly_merchant_unreachable": {
-        "suffix": "·联系不上店",
-        "store_meta": {"phone_unreachable": True},
-    },
-    "anomaly_store_overcapacity": {
-        "suffix": "·排队超负荷店",
-        "store_meta": {"over_capacity": True},
-    },
+    "anomaly_merchant_unreachable": {"suffix": "·远郊店"},
+    "anomaly_store_overcapacity": {"suffix": "·热门店"},
     "anomaly_early_closure": {
-        "suffix": "·提前打烊店",
-        "store_meta": {"early_closure": True},
+        "suffix": "·当日早收店",
         "business_hours": "10:00-22:00",
+        "store_meta": {"today_hours": "10:00-14:00"},
     },
     "anomaly_no_reservation": {
         "suffix": "·需预约店",
-        "order_meta": {"reservation_required": True, "reservation_confirmed": False},
+        "supports_reservation": True,
+        "usage_rule_key": "must_reserve",
+        "skip_reservation": True,
     },
     "anomaly_reservation_denied": {
-        "suffix": "·拒预约店",
+        "suffix": "·预约门店",
         "status": "unused",
-        "order_meta": {"reservation_required": True},
+        "supports_reservation": True,
+        "usage_rule_key": "must_reserve",
+        "skip_reservation": True,
     },
     "anomaly_reservation_failed": {
-        "suffix": "·约满店",
+        "suffix": "·约满门店",
         "status": "unused",
-        "order_meta": {"reservation_required": True},
+        "supports_reservation": True,
+        "usage_rule_key": "must_reserve",
+        "skip_reservation": True,
     },
     "anomaly_off_hours": {
-        "suffix": "·非全营业店",
+        "suffix": "·夜间营业店",
         "status": "scheduled",
         "business_hours": "17:00-02:00",
-        "order_meta": {"reservation_required": True, "reservation_confirmed": True},
+        "supports_reservation": True,
+        "usage_rule_key": "must_reserve",
+        "service_time_offset_hours": 4,
     },
-    "anomaly_weekend_only": {
-        "suffix": "·周末限定店",
-        "order_meta": {"time_restricted": True, "allowed_now": False},
-    },
-    "anomaly_lunch_only": {
-        "suffix": "·午市限定店",
-        "order_meta": {"time_restricted": True, "allowed_now": False},
-    },
-    "anomaly_wrong_store": {
-        "suffix": "·跨店误到店",
-        "order_meta": {"store_mismatch": True},
-    },
-    "anomaly_service_mismatch": {"suffix": "·套餐缩水店", "status": "scheduled"},
-    "anomaly_price_increase": {"suffix": "·临时加价店", "status": "unused"},
-    "anomaly_force_consumption": {"suffix": "·强制消费店"},
-    "anomaly_out_of_stock": {"suffix": "·缺货店", "status": "scheduled"},
+    "anomaly_weekend_only": {"suffix": "·周末店", "usage_rule_key": "weekend_only"},
+    "anomaly_lunch_only": {"suffix": "·午市店", "usage_rule_key": "lunch_only"},
+    "anomaly_wrong_store": {"suffix": "·A店", "wrong_store": True},
+    "anomaly_service_mismatch": {"suffix": "·套餐店", "status": "scheduled"},
+    "anomaly_price_increase": {"suffix": "·加价争议店", "status": "unused"},
+    "anomaly_force_consumption": {"suffix": "·高消店"},
+    "anomaly_out_of_stock": {"suffix": "·热销店", "status": "scheduled"},
     "anomaly_expired_demand_refund": {
         "suffix": "·过期券",
         "status": "expired",
         "voucher_status": "expired",
         "can_refund": False,
-        "order_meta": {"expired_refund_eligible": False},
+        "usage_rule_key": "expired_no_refund",
     },
     "anomaly_expired_demand_verify": {
         "suffix": "·过期仍要用",
@@ -171,17 +153,17 @@ ANOMALY_DEFS: dict[str, dict] = {
         "reject_refund": True,
     },
     "anomaly_frozen_voucher": {
-        "suffix": "·券冻结",
+        "suffix": "·风控冻结",
         "voucher_status": "frozen",
         "can_refund": False,
     },
     "anomaly_no_refund_product": {
         "suffix": "·特价不退",
         "can_refund": False,
-        "order_meta": {"no_refund_product": True, "promo_non_refundable": True},
+        "usage_rule_key": "no_refund",
     },
     "anomaly_used_complaint": {
-        "suffix": "·品质争议店",
+        "suffix": "·品质争议",
         "status": "used",
         "voucher_status": "used",
         "can_refund": False,
@@ -190,23 +172,13 @@ ANOMALY_DEFS: dict[str, dict] = {
 }
 
 USAGE_RULES: dict[str, str] = {
-    "anomaly_weekend_only": "仅限周六、周日使用，工作日不可核销。",
-    "anomaly_lunch_only": "仅限每日 11:00-14:00 午市使用，其他时段不可核销。",
-    "anomaly_no_reservation": "须提前预约成功后方可到店核销，未预约不可使用。",
-    "anomaly_off_hours": "请按预约时段到店；门店非 24 小时营业，请以详情页营业时间为准。",
-    "anomaly_early_closure": "若遇门店提前结束营业，可改期或按平台规则申请售后。",
-    "anomaly_store_closed": "门店暂停营业期间不可核销，恢复营业后可使用。",
-    "anomaly_store_permanent_closed": "门店已永久闭店，请申请退款或联系客服转店。",
-    "anomaly_merchant_reject": "到店出示抖音券码核销；若商家拒收请保留凭证并联系平台。",
-    "anomaly_merchant_campaign_end": "若商家称活动结束但平台显示券有效，以平台状态为准并可投诉。",
-    "anomaly_scanner_unsynced": "支持抖音码扫码或手动输入券码；若扫码失败可重新生成核销码。",
-    "anomaly_wrong_store": "仅适用于购买页公示的门店列表，非适用门店不可核销。",
-    "anomaly_no_refund_product": "本商品为特价促销款，标注「不可退」；未核销亦不支持自助退款。",
-    "anomaly_frozen_voucher": "券暂被系统冻结，请联系平台客服处理后再核销。",
+    "must_reserve": "须提前预约成功后方可到店核销，未预约不可使用。",
+    "weekend_only": "仅限周六、周日使用，工作日不可核销。",
+    "lunch_only": "仅限每日 11:00-14:00 午市使用，其他时段不可核销。",
+    "no_refund": "本商品为特价促销款，标注「不可退」；未核销亦不支持自助退款。",
+    "expired_no_refund": "已过期；本商品不支持过期退，无法自助退款。",
     "expired_unused": "已过期不可核销；标注过期退的商品可按平台规则处理。",
-    "anomaly_expired_demand_refund": "已过期；本商品不支持过期退，无法自助退款。",
-    "anomaly_expired_demand_verify": "已过期不可核销。",
-    "anomaly_used_demand_refund": "已核销视为已消费，自助退款通道已关闭。",
+    "default": "需按订单规则预约或到店核销，不可与其他优惠叠加。",
 }
 
 
@@ -218,54 +190,56 @@ def sql_json(data: dict) -> str:
     return esc(json.dumps(data, ensure_ascii=False))
 
 
+def service_type_needs_reservation(i: int) -> bool:
+    return SERVICE_TYPES[i % len(SERVICE_TYPES)] in ("团购套餐", "预约服务", "酒店套餐")
+
+
 def _voucher_status(order_status: str, scenario: str) -> str:
     spec = ANOMALY_DEFS.get(scenario, {})
     if spec.get("voucher_status"):
         return str(spec["voucher_status"])
-    mapping = {
+    return {
         "unused": "unused",
         "scheduled": "scheduled",
         "used": "used",
         "refunding": "refund_pending",
         "refunded": "used",
         "expired": "expired",
-    }
-    return mapping.get(order_status, "unused")
+    }.get(order_status, "unused")
 
 
-def service_type_needs_reservation(i: int) -> bool:
-    st = SERVICE_TYPES[i % len(SERVICE_TYPES)]
-    return st in ("团购套餐", "预约服务", "酒店套餐")
+def _usage_rule(scenario: str) -> str:
+    spec = ANOMALY_DEFS.get(scenario, {})
+    key = spec.get("usage_rule_key")
+    if key and key in USAGE_RULES:
+        return USAGE_RULES[key]
+    if scenario == "expired_unused":
+        return USAGE_RULES["expired_unused"]
+    return USAGE_RULES["default"]
 
 
 def _build_store(i: int, scenario: str) -> tuple:
     cat = CATEGORIES[i % len(CATEGORIES)]
     city = CITIES[i % len(CITIES)]
     merchant = f"{MERCHANT_PREFIX[i % len(MERCHANT_PREFIX)]}{cat[:2]}"
-    spec = ANOMALY_DEFS.get(scenario)
-    if spec:
-        store_name = f"{merchant}{spec['suffix']}"
-        meta = {"business_status": "open", "scanner_synced": True}
-        meta.update(spec.get("store_meta") or {})
-        hours = spec.get("business_hours") or random.choice(["10:00-22:00", "09:30-24:00", "11:00-23:00"])
-        supports_res = scenario in (
-            "anomaly_no_reservation",
-            "anomaly_reservation_denied",
-            "anomaly_reservation_failed",
-            "anomaly_off_hours",
-        )
-    else:
-        store_name = f"{merchant}·{city}店"
-        meta = {"business_status": "open", "scanner_synced": random.random() > 0.12}
-        hours = random.choice(["10:00-22:00", "09:30-24:00", "11:00-23:00", "12:00-02:00"])
-        supports_res = service_type_needs_reservation(i)
+    spec = ANOMALY_DEFS.get(scenario, {})
+    store_name = f"{merchant}{spec.get('suffix', f'·{city}店')}"
+    meta: dict = {"business_status": "open"}
+    meta.update(spec.get("store_meta") or {})
+    hours = spec.get("business_hours") or random.choice(["10:00-22:00", "09:30-24:00", "11:00-23:00"])
+    supports_res = bool(spec.get("supports_reservation")) or (
+        not spec and service_type_needs_reservation(i)
+    )
+    address = f"{city}市示例区示例路 {i} 号"
+    if scenario == "anomaly_store_relocated":
+        address = f"{city}市示例区新路 {i} 号"
     return (
         f"store_{i:03d}",
         merchant,
         store_name,
         cat,
         city,
-        f"{city}市示例区示例路 {i} 号",
+        address,
         hours,
         f"010-{random.randint(10000000, 99999999)}",
         supports_res,
@@ -273,23 +247,18 @@ def _build_store(i: int, scenario: str) -> tuple:
     )
 
 
-def _build_anomaly_order(
-    i: int, user_id: str, store: tuple, scenario: str, service_type: str, paid: float, original: float
-) -> tuple:
+def _build_anomaly_order(i: int, user_id: str, store: tuple, scenario: str, service_type: str, paid: float, original: float) -> tuple:
     spec = ANOMALY_DEFS[scenario]
     status = str(spec.get("status", "unused"))
     purchase = NOW - timedelta(days=random.randint(1, 6))
     service_time = None
     expire = purchase + timedelta(days=random.randint(14, 35))
+    meta: dict = {}
 
     if status == "scheduled":
         purchase = NOW - timedelta(days=random.randint(1, 4))
-        if scenario == "anomaly_off_hours":
-            service_time = NOW.replace(hour=14, minute=0, second=0, microsecond=0)
-            if service_time < NOW:
-                service_time += timedelta(days=1)
-        else:
-            service_time = NOW + timedelta(hours=random.randint(4, 36))
+        offset_h = int(spec.get("service_time_offset_hours", random.randint(4, 36)))
+        service_time = NOW + timedelta(hours=offset_h)
     elif status == "used":
         purchase = NOW - timedelta(days=random.randint(2, 6))
         service_time = NOW - timedelta(hours=random.randint(6, 72))
@@ -297,16 +266,9 @@ def _build_anomaly_order(
         purchase = NOW - timedelta(days=random.randint(50, 70))
         expire = NOW - timedelta(days=random.randint(1, 10))
 
-    meta: dict = dict(spec.get("order_meta") or {})
-
-    reservation_required = bool(
-        meta.get("reservation_required")
-        or service_type in ("团购套餐", "预约服务", "酒店套餐")
-        or scenario.startswith("anomaly_no_reservation")
-        or scenario.startswith("anomaly_reservation")
-    )
-    if reservation_required and "reservation_required" not in meta:
-        meta["reservation_required"] = True
+    if status == "scheduled" and spec.get("usage_rule_key") == "must_reserve" and not spec.get("skip_reservation"):
+        meta["reservation_confirmed"] = True
+        meta["appointment"] = service_time.isoformat() if service_time else (NOW + timedelta(hours=24)).isoformat()
 
     can_refund = bool(spec.get("can_refund", True))
     can_reschedule = status == "scheduled" and service_type in ("电影票", "预约服务", "酒店套餐")
@@ -338,15 +300,10 @@ def _build_order(i: int, user_id: str, store: tuple, scenario: str) -> tuple:
     if scenario in ANOMALY_DEFS:
         return _build_anomaly_order(i, user_id, store, scenario, service_type, paid, original)
 
-    reservation_required = service_type in ("团购套餐", "预约服务", "酒店套餐")
-
     if scenario == "fresh_purchase":
-        status = "unused"
-        purchase = NOW - timedelta(hours=random.randint(1, 36))
-        service_time = None
-        expire = purchase + timedelta(days=random.randint(14, 45))
-        can_refund = True
-        meta = {"reservation_required": reservation_required, "reservation_confirmed": False}
+        status, purchase = "unused", NOW - timedelta(hours=random.randint(1, 36))
+        service_time, expire = None, purchase + timedelta(days=random.randint(14, 45))
+        can_refund, meta = True, {}
 
     elif scenario == "scheduled_soon":
         status = "scheduled"
@@ -354,62 +311,49 @@ def _build_order(i: int, user_id: str, store: tuple, scenario: str) -> tuple:
         service_time = NOW + timedelta(hours=random.randint(2, 48))
         expire = purchase + timedelta(days=random.randint(14, 45))
         can_refund = True
-        meta = {
-            "reservation_required": reservation_required,
-            "reservation_confirmed": True,
-            "appointment": service_time.isoformat(),
-        }
+        meta = {"reservation_confirmed": True, "appointment": service_time.isoformat()}
 
     elif scenario == "verified_recent":
         status = "used"
         purchase = NOW - timedelta(days=random.randint(2, 7))
         service_time = NOW - timedelta(hours=random.randint(2, 48))
         expire = purchase + timedelta(days=random.randint(14, 45))
-        can_refund = False
-        meta = {"reservation_required": reservation_required, "reservation_confirmed": True}
+        can_refund, meta = False, {"reservation_confirmed": True}
 
     elif scenario == "completed_earlier":
         status = "used"
         purchase = NOW - timedelta(days=random.randint(14, 45))
         service_time = purchase + timedelta(days=random.randint(3, 10))
         expire = purchase + timedelta(days=random.randint(30, 60))
-        can_refund = False
-        meta = {"reservation_required": reservation_required, "reservation_confirmed": True}
+        can_refund, meta = False, {"reservation_confirmed": True}
 
     elif scenario == "expired_unused":
         status = "expired"
         purchase = NOW - timedelta(days=random.randint(45, 75))
-        service_time = None
-        expire = NOW - timedelta(days=random.randint(1, 14))
-        can_refund = False
-        meta = {"reservation_required": reservation_required}
+        service_time, expire = None, NOW - timedelta(days=random.randint(1, 14))
+        can_refund, meta = False, {}
 
     elif scenario == "refunding":
         status = "refunding"
         purchase = NOW - timedelta(days=random.randint(3, 10))
         service_time = purchase + timedelta(days=1)
         expire = purchase + timedelta(days=30)
-        can_refund = False
-        meta = {"reservation_required": reservation_required, "reservation_confirmed": True}
+        can_refund, meta = False, {"reservation_confirmed": True}
 
     elif scenario == "refunded":
-        status = "refunded"
-        purchase = NOW - timedelta(days=random.randint(5, 20))
-        service_time = None
-        expire = purchase + timedelta(days=30)
-        can_refund = False
-        meta = {"reservation_required": reservation_required}
+        status, purchase = "refunded", NOW - timedelta(days=random.randint(5, 20))
+        service_time, expire = None, purchase + timedelta(days=30)
+        can_refund, meta = False, {}
 
     else:
-        status = "unused"
-        purchase = NOW - timedelta(days=1)
-        service_time = None
-        expire = purchase + timedelta(days=30)
-        can_refund = True
-        meta = {}
+        status, purchase = "unused", NOW - timedelta(days=1)
+        service_time, expire = None, purchase + timedelta(days=30)
+        can_refund, meta = True, {}
+
+    if i == 1:
+        meta = {**meta, "seed_time_anchor": SEED_ANCHOR.isoformat()}
 
     can_reschedule = status == "scheduled" and service_type in ("电影票", "预约服务", "酒店套餐")
-
     return (
         f"order_{i:03d}",
         user_id,
@@ -429,13 +373,17 @@ def _build_order(i: int, user_id: str, store: tuple, scenario: str) -> tuple:
     )
 
 
-def _usage_rule(scenario: str) -> str:
-    return USAGE_RULES.get(scenario, "需按订单规则预约或到店核销，不可与其他优惠叠加。")
+def _voucher_store_id(order: tuple, scenario: str, stores: list[tuple]) -> str:
+    order_store = order[2]
+    if scenario == "anomaly_wrong_store":
+        idx = int(order_store.replace("store_", ""))
+        alt = max(1, idx - 1)
+        return f"store_{alt:03d}"
+    return order_store
 
 
 def _build_refund(order: tuple) -> tuple | None:
-    scenario = order[14]
-    status = order[5]
+    scenario, status = order[14], order[5]
     spec = ANOMALY_DEFS.get(scenario, {})
     if spec.get("reject_refund"):
         reason = {
@@ -475,22 +423,9 @@ def _build_refund(order: tuple) -> tuple | None:
 
 
 def _build_events(order: tuple) -> list[tuple]:
-    oid, uid, sid, _, _, status, paid, _, purchase_iso, service_iso, _, _, meta, scenario = (
-        order[0],
-        order[1],
-        order[2],
-        order[3],
-        order[4],
-        order[5],
-        order[6],
-        order[7],
-        order[8],
-        order[9],
-        order[10],
-        order[11],
-        order[13],
-        order[14],
-    )
+    oid, uid, sid = order[0], order[1], order[2]
+    status, paid = order[5], order[6]
+    purchase_iso, service_iso, meta, scenario = order[8], order[9], order[13], order[14]
     purchase = datetime.fromisoformat(purchase_iso.replace("Z", "+00:00"))
     service = (
         datetime.fromisoformat(service_iso.replace("Z", "+00:00"))
@@ -517,9 +452,7 @@ def _build_events(order: tuple) -> list[tuple]:
 
     if status in ("used", "refunding") or spec.get("reject_refund"):
         events.append((oid, uid, sid, "arrive", "success", {"summary": "用户到店"}, (service - timedelta(minutes=20)).isoformat()))
-        events.append(
-            (oid, uid, sid, "verify", "success", {"summary": "门店核销成功，套餐已使用"}, service.isoformat())
-        )
+        events.append((oid, uid, sid, "verify", "success", {"summary": "门店核销成功，套餐已使用"}, service.isoformat()))
 
     if status in ("refunding", "refunded"):
         refund = _build_refund(order)
@@ -542,79 +475,65 @@ def _build_events(order: tuple) -> list[tuple]:
                     else (purchase + timedelta(days=3)).isoformat(),
                 )
             )
-
     return events
 
 
 def main() -> None:
-    assert len(ANOMALY_PLAN) == 40
-    assert len(SCENARIO_PLAN) == 120
+    assert len(ANOMALY_PLAN) == 40 and len(SCENARIO_PLAN) == 120
 
-    lines: list[str] = [
-        "-- Bulk mock data generated by scripts/generate_mock_data.py",
-        "-- 仅业务事实字段；无诊断结论、无预填 agent_operation_logs / 对话",
-        "-- 平台知识库见 deploy/init-db/02-knowledge-seed.sql",
+    lines = [
+        "-- Generated by scripts/generate_mock_data.py",
+        "-- 客观业务事实 only；时间锚点见 order_001.metadata.seed_time_anchor，启动时 mock_time_shift 对齐",
         "",
     ]
 
-    users: list[tuple] = []
-    for i in range(1, 121):
-        city = CITIES[i % len(CITIES)]
-        users.append(
-            (
-                f"user_{i:03d}",
-                f"用户{i:03d}",
-                city,
-                random.choice(["普通用户", "生活服务银卡", "生活服务金卡", "黑金会员"]),
-                f"13{random.randint(0, 9)}****{random.randint(1000, 9999)}",
-            )
+    users = [
+        (
+            f"user_{i:03d}",
+            f"用户{i:03d}",
+            CITIES[i % len(CITIES)],
+            random.choice(["普通用户", "生活服务银卡", "生活服务金卡", "黑金会员"]),
+            f"13{random.randint(0, 9)}****{random.randint(1000, 9999)}",
         )
-    lines.append("INSERT INTO users (id, display_name, city, membership_level, phone_mask) VALUES")
-    lines.append(",\n".join(f"  ('{u[0]}', '{esc(u[1])}', '{u[2]}', '{u[3]}', '{u[4]}')" for u in users))
-    lines.append("ON CONFLICT (id) DO NOTHING;\n")
+        for i in range(1, 121)
+    ]
+    lines += [
+        "INSERT INTO users (id, display_name, city, membership_level, phone_mask) VALUES",
+        ",\n".join(f"  ('{u[0]}', '{esc(u[1])}', '{u[2]}', '{u[3]}', '{u[4]}')" for u in users),
+        "ON CONFLICT (id) DO NOTHING;\n",
+    ]
 
-    stores: list[tuple] = []
-    for i in range(1, 121):
-        scenario = SCENARIO_PLAN[i - 1]
-        stores.append(_build_store(i, scenario))
-
-    lines.append(
-        "INSERT INTO merchant_stores (id, merchant_name, store_name, category, city, address, business_hours, phone, supports_reservation, metadata) VALUES"
-    )
-    lines.append(
+    stores = [_build_store(i, SCENARIO_PLAN[i - 1]) for i in range(1, 121)]
+    lines += [
+        "INSERT INTO merchant_stores (id, merchant_name, store_name, category, city, address, business_hours, phone, supports_reservation, metadata) VALUES",
         ",\n".join(
             f"  ('{s[0]}', '{esc(s[1])}', '{esc(s[2])}', '{s[3]}', '{s[4]}', '{esc(s[5])}', '{s[6]}', '{s[7]}', {str(s[8]).upper()}, '{sql_json(s[9])}'::jsonb)"
             for s in stores
-        )
-    )
-    lines.append("ON CONFLICT (id) DO UPDATE SET metadata = EXCLUDED.metadata, business_hours = EXCLUDED.business_hours, store_name = EXCLUDED.store_name;\n")
+        ),
+        "ON CONFLICT (id) DO UPDATE SET metadata = EXCLUDED.metadata, business_hours = EXCLUDED.business_hours, store_name = EXCLUDED.store_name, address = EXCLUDED.address;\n",
+    ]
 
-    orders: list[tuple] = []
-    for i in range(1, 121):
-        scenario = SCENARIO_PLAN[i - 1]
-        orders.append(_build_order(i, f"user_{i:03d}", stores[i - 1], scenario))
+    orders = [_build_order(i, f"user_{i:03d}", stores[i - 1], SCENARIO_PLAN[i - 1]) for i in range(1, 121)]
+    lines += [
+        "INSERT INTO life_orders (id, user_id, store_id, service_type, title, status, paid_amount, original_amount, purchase_time, service_time, expire_time, can_refund, can_reschedule, metadata) VALUES",
+        ",\n".join(
+            f"  ('{o[0]}', '{o[1]}', '{o[2]}', '{esc(o[3])}', '{esc(o[4])}', '{o[5]}', {o[6]}, {o[7]}, '{o[8]}'::timestamptz, "
+            f"{('NULL' if not o[9] else "'" + o[9] + "'::timestamptz")}, '{o[10]}'::timestamptz, {str(o[11]).upper()}, {str(o[12]).upper()}, '{sql_json(o[13])}'::jsonb)"
+            for o in orders
+        ),
+        "ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status, metadata = EXCLUDED.metadata, service_time = EXCLUDED.service_time, can_refund = EXCLUDED.can_refund;\n",
+    ]
 
-    lines.append(
-        "INSERT INTO life_orders (id, user_id, store_id, service_type, title, status, paid_amount, original_amount, purchase_time, service_time, expire_time, can_refund, can_reschedule, metadata) VALUES"
-    )
-    order_values = []
-    for o in orders:
-        st = f"'{o[9]}'::timestamptz" if o[9] else "NULL"
-        order_values.append(
-            f"  ('{o[0]}', '{o[1]}', '{o[2]}', '{esc(o[3])}', '{esc(o[4])}', '{o[5]}', {o[6]}, {o[7]}, '{o[8]}'::timestamptz, {st}, '{o[10]}'::timestamptz, {str(o[11]).upper()}, {str(o[12]).upper()}, '{sql_json(o[13])}'::jsonb)"
-        )
-    lines.append(",\n".join(order_values))
-    lines.append("ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status, metadata = EXCLUDED.metadata, service_time = EXCLUDED.service_time, can_refund = EXCLUDED.can_refund;\n")
-
-    vouchers: list[tuple] = []
+    vouchers = []
     for i, o in enumerate(orders, start=1):
         scenario = o[14]
+        vsid = _voucher_store_id(o, scenario, stores)
         vouchers.append(
             (
                 f"voucher_{i:03d}",
                 o[0],
                 o[1],
-                o[2],
+                vsid,
                 f"DY{i:04d}-{random.randint(1000, 9999)}",
                 o[4],
                 _voucher_status(o[5], scenario),
@@ -623,79 +542,56 @@ def main() -> None:
                 _usage_rule(scenario),
             )
         )
-    lines.append(
-        "INSERT INTO vouchers (id, order_id, user_id, store_id, code, title, status, valid_from, valid_to, usage_rule) VALUES"
-    )
-    lines.append(
+    lines += [
+        "INSERT INTO vouchers (id, order_id, user_id, store_id, code, title, status, valid_from, valid_to, usage_rule) VALUES",
         ",\n".join(
             f"  ('{v[0]}', '{v[1]}', '{v[2]}', '{v[3]}', '{v[4]}', '{esc(v[5])}', '{v[6]}', '{v[7]}'::timestamptz, '{v[8]}'::timestamptz, '{esc(v[9])}')"
             for v in vouchers
-        )
-    )
-    lines.append("ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status, usage_rule = EXCLUDED.usage_rule;\n")
+        ),
+        "ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status, usage_rule = EXCLUDED.usage_rule, store_id = EXCLUDED.store_id;\n",
+    ]
 
-    coupons: list[tuple] = []
-    for i in range(1, 121):
-        user_id = f"user_{i:03d}"
-        cat = CATEGORIES[i % len(CATEGORIES)]
-        coupons.append(
-            (
-                f"coupon_{i:03d}",
-                user_id,
-                f"{cat}满 {random.randint(80, 200)} 减 {random.randint(10, 50)}",
-                random.randint(10, 50),
-                random.randint(80, 200),
-                cat,
-                stores[i - 1][0] if i % 4 == 0 else None,
-                COUPON_STATUSES[i % len(COUPON_STATUSES)],
-                (NOW + timedelta(days=random.randint(1, 30))).isoformat(),
-                "满足门槛可用，部分券不可与团购套餐叠加。",
-            )
+    coupons = [
+        (
+            f"coupon_{i:03d}",
+            f"user_{i:03d}",
+            f"{CATEGORIES[i % len(CATEGORIES)]}满 {random.randint(80, 200)} 减 {random.randint(10, 50)}",
+            random.randint(10, 50),
+            random.randint(80, 200),
+            CATEGORIES[i % len(CATEGORIES)],
+            stores[i - 1][0] if i % 4 == 0 else None,
+            COUPON_STATUSES[i % len(COUPON_STATUSES)],
+            (NOW + timedelta(days=random.randint(1, 30))).isoformat(),
+            "满足门槛可用，部分券不可与团购套餐叠加。",
         )
-    lines.append(
-        "INSERT INTO coupons (id, user_id, title, discount_amount, threshold_amount, applicable_category, applicable_store_id, status, valid_to, rule_text) VALUES"
-    )
-    coupon_values = []
-    for c in coupons:
-        store_id = f"'{c[6]}'" if c[6] else "NULL"
-        coupon_values.append(
-            f"  ('{c[0]}', '{c[1]}', '{esc(c[2])}', {c[3]}, {c[4]}, '{c[5]}', {store_id}, '{c[7]}', '{c[8]}'::timestamptz, '{esc(c[9])}')"
-        )
-    lines.append(",\n".join(coupon_values))
-    lines.append("ON CONFLICT (id) DO NOTHING;\n")
-
-    refunds: list[tuple] = []
-    for o in orders:
-        r = _build_refund(o)
-        if r:
-            refunds.append(r)
-    lines.append(
-        "INSERT INTO refund_cases (id, order_id, user_id, reason, status, refundable_amount, estimated_finish_time) VALUES"
-    )
-    lines.append(
+        for i in range(1, 121)
+    ]
+    lines += [
+        "INSERT INTO coupons (id, user_id, title, discount_amount, threshold_amount, applicable_category, applicable_store_id, status, valid_to, rule_text) VALUES",
         ",\n".join(
-            f"  ('{r[0]}', '{r[1]}', '{r[2]}', '{esc(r[3])}', '{r[4]}', {r[5]}, '{r[6]}'::timestamptz)" for r in refunds
-        )
-    )
-    lines.append("ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status, reason = EXCLUDED.reason;\n")
+            f"  ('{c[0]}', '{c[1]}', '{esc(c[2])}', {c[3]}, {c[4]}, '{c[5]}', {('NULL' if not c[6] else "'" + c[6] + "'")}, '{c[7]}', '{c[8]}'::timestamptz, '{esc(c[9])}')"
+            for c in coupons
+        ),
+        "ON CONFLICT (id) DO NOTHING;\n",
+    ]
 
-    events: list[tuple] = []
-    for o in orders:
-        events.extend(_build_events(o))
-    lines.append(
-        "INSERT INTO fulfillment_events (order_id, user_id, store_id, event_type, status, detail, created_at) VALUES"
-    )
-    lines.append(
-        ",\n".join(
-            f"  ('{e[0]}', '{e[1]}', '{e[2]}', '{e[3]}', '{e[4]}', '{sql_json(e[5])}'::jsonb, '{e[6]}'::timestamptz)"
-            for e in events
-        )
-    )
-    lines.append(";\n")
+    refunds = [r for o in orders if (r := _build_refund(o))]
+    lines += [
+        "INSERT INTO refund_cases (id, order_id, user_id, reason, status, refundable_amount, estimated_finish_time) VALUES",
+        ",\n".join(f"  ('{r[0]}', '{r[1]}', '{r[2]}', '{esc(r[3])}', '{r[4]}', {r[5]}, '{r[6]}'::timestamptz)" for r in refunds),
+        "ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status, reason = EXCLUDED.reason;\n",
+    ]
+
+    events = [e for o in orders for e in _build_events(o)]
+    lines += [
+        "INSERT INTO fulfillment_events (order_id, user_id, store_id, event_type, status, detail, created_at) VALUES",
+        ",\n".join(f"  ('{e[0]}', '{e[1]}', '{e[2]}', '{e[3]}', '{e[4]}', '{sql_json(e[5])}'::jsonb, '{e[6]}'::timestamptz)" for e in events),
+        ";\n",
+    ]
 
     OUT.write_text("\n".join(lines), encoding="utf-8")
     print(f"Wrote {OUT} ({OUT.stat().st_size // 1024} KB)")
-    print(f"  orders={len(orders)} refunds={len(refunds)} events={len(events)} anomalies={len(ANOMALY_PLAN)}")
+    print(f"  anchor={SEED_ANCHOR.isoformat()} orders={len(orders)} refunds={len(refunds)} anomalies={len(ANOMALY_PLAN)}")
 
 
 if __name__ == "__main__":

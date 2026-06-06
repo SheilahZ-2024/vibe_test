@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.bulk_bootstrap import ensure_bulk_seed
 from app.db.knowledge_bootstrap import ensure_knowledge_seed
+from app.db.mock_time_shift import shift_mock_timestamps
 
 MIGRATIONS = [
     """
@@ -77,4 +78,5 @@ async def apply_migrations(db: AsyncSession) -> None:
         await db.execute(text(sql))
     await ensure_knowledge_seed(db)
     await ensure_bulk_seed(db)
+    await shift_mock_timestamps(db)
     await db.commit()
