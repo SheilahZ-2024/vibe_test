@@ -75,6 +75,13 @@ class Settings(BaseSettings):
     )
     agent_tone_polish_max_tokens: int = Field(default=384, validation_alias=AliasChoices("AGENT_TONE_POLISH_MAX_TOKENS"))
     agent_tone_polish_min_chars: int = Field(default=8, validation_alias=AliasChoices("AGENT_TONE_POLISH_MIN_CHARS"))
+    agent_parallel_intent_knowledge: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("AGENT_PARALLEL_INTENT_KNOWLEDGE"),
+    )
+
+    error_recovery_use_llm: bool = Field(default=True, validation_alias=AliasChoices("ERROR_RECOVERY_USE_LLM"))
+    error_recovery_max_tokens: int = Field(default=320, validation_alias=AliasChoices("ERROR_RECOVERY_MAX_TOKENS"))
 
     api_secret_key: str = "dev-secret-change-me"
     cors_origins: str = "http://localhost:5173,http://localhost:3000"

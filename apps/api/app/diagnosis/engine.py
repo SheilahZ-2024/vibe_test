@@ -280,7 +280,7 @@ class DiagnosisEngine:
             return self._from_case("FC-019", "VoucherUnavailable", ctx, steps, "high")
         steps.append(DiagnosisStep(8, "门店营业", "pass", "ok"))
 
-        if any(k in ctx.message for k in ("老板不给", "不让用", "活动结束", "拒绝核销")):
+        if any(k in ctx.message for k in ("老板不给", "不让用", "不让我核销", "不让核销", "活动结束", "拒绝核销")):
             case = "FC-007" if "活动结束" in ctx.message else "FC-006"
             steps.append(DiagnosisStep(9, "商家接待", "fail", "用户描述拒核销", "MerchantRejectService", case))
             return self._from_case(case, "VoucherUnavailable", ctx, steps, "medium")
@@ -309,7 +309,7 @@ class DiagnosisEngine:
             (("没人", "缺席", "不管"), "FC-018"),
             (("接待", "不让进", "拒绝接待"), "FC-012"),
             (("活动结束",), "FC-007"),
-            (("老板不给", "不给用", "拒绝核销"), "FC-006"),
+            (("老板不给", "不给用", "不让我核销", "不让核销", "拒绝核销"), "FC-006"),
         ]
         for keys, case_id in checks:
             if any(k in msg for k in keys):

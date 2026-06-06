@@ -26,6 +26,7 @@ _TOOL_PHRASES: dict[str, str] = {
     "query_coupon": "查询优惠券",
     "query_refund": "查询退款资格与进度",
     "query_ticket": "查询工单进度",
+    "search_knowledge": "检索平台政策与 FAQ",
     "run_diagnosis": "对照平台诊断规则做结构化分析",
     "regenerate_qr": "重新生成核销码",
     "contact_merchant": "联系商家协助",

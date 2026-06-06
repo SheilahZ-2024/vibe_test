@@ -10,7 +10,6 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.repositories.life_service import KnowledgeRepository
 from app.schemas.api import EdgeContextPacket
 from app.services.agent_state import (
     AgentFinishDecision,
@@ -93,7 +92,6 @@ def _emit_thinking(lines: list[str]) -> list[tuple[str, dict]]:
 class FulfillmentAgent:
     def __init__(self):
         self.context_builder = ServiceContextBuilder()
-        self.knowledge = KnowledgeRepository()
         self.llm = LLMService()
         self.intent_classifier = IntentClassifier(self.llm)
         self.tool_executor = AgentToolExecutor()
@@ -119,17 +117,7 @@ class FulfillmentAgent:
         trimmed_history = _trim_history(history, settings.agent_history_max_turns)
 
         intent_result = await self.intent_classifier.classify(message, trimmed_history)
-
         knowledge_hits: list = []
-        if intent_result.route_category != "chitchat":
-            order_titles = [str(o.get("title") or "") for o in service_context.get("orders") or []]
-            knowledge_hits = await self.knowledge.search_contextual(
-                db,
-                message,
-                intent=intent_result.route_intent,
-                order_titles=order_titles,
-                limit=3,
-            )
 
         state = AgentState(
             session_id=session_id,
@@ -474,7 +462,7 @@ class FulfillmentAgent:
             step_n += 1
 
         diag_intent = intent.route_intent if intent.route_intent in ACTIONABLE_INTENTS else "QueryOrder"
-        if any(k in msg for k in ("核销", "扫不出", "用不了", "老板不给")):
+        if any(k in msg for k in ("核销", "扫不出", "用不了", "老板不给", "不让我核销")):
             diag_intent = "VoucherUnavailable"
         elif any(k in msg for k in ("退款", "退掉")):
             diag_intent = "RefundRequest"

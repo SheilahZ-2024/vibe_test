@@ -38,6 +38,18 @@ TOOL_CATALOG: dict[str, dict] = {
         "parameters": {},
         "read_only": True,
     },
+    "search_knowledge": {
+        "description": (
+            "检索平台知识库（政策/FAQ/核销规则）。按需调用，自行决定 query 与条数 limit(1~5)；"
+            "复杂或政策相关问题建议先查再 finish。"
+        ),
+        "parameters": {
+            "query": "string 可选，默认用户最新表述",
+            "limit": "int 可选，1~5，默认 3",
+            "intent": "string 可选，辅助检索的意图标签",
+        },
+        "read_only": True,
+    },
     "run_diagnosis": {
         "description": (
             "【轨道 B · 异步】触发诊断引擎脚本，返回结构化 Case/步骤/推荐动作。"
@@ -98,19 +110,28 @@ WRITE_ACTION_TITLES: dict[str, str] = {
 _INTENT_TOOL_SETS: dict[str, tuple[str, ...]] = {
     "chitchat": ("list_orders", "human_handoff"),
     "unconfigured": ("list_orders", "human_handoff"),
-    "clarify": ("list_orders", "query_order", "query_voucher", "human_handoff"),
-    "QueryOrder": ("list_orders", "query_order", "query_voucher", "human_handoff"),
-    "QueryVoucher": ("list_orders", "query_order", "query_voucher", "run_diagnosis", "human_handoff"),
-    "QueryCoupon": ("list_orders", "query_coupon", "human_handoff"),
-    "QueryStore": ("list_orders", "query_order", "query_store", "human_handoff"),
-    "QueryReservation": ("list_orders", "query_order", "query_store", "create_reservation", "run_diagnosis", "human_handoff"),
-    "QueryRefund": ("list_orders", "query_order", "query_refund", "human_handoff"),
-    "QueryTicket": ("list_orders", "query_ticket", "human_handoff"),
+    "clarify": ("list_orders", "query_order", "query_voucher", "search_knowledge", "human_handoff"),
+    "QueryOrder": ("list_orders", "query_order", "query_voucher", "search_knowledge", "human_handoff"),
+    "QueryVoucher": ("list_orders", "query_order", "query_voucher", "search_knowledge", "run_diagnosis", "human_handoff"),
+    "QueryCoupon": ("list_orders", "query_coupon", "search_knowledge", "human_handoff"),
+    "QueryStore": ("list_orders", "query_order", "query_store", "search_knowledge", "human_handoff"),
+    "QueryReservation": (
+        "list_orders",
+        "query_order",
+        "query_store",
+        "search_knowledge",
+        "create_reservation",
+        "run_diagnosis",
+        "human_handoff",
+    ),
+    "QueryRefund": ("list_orders", "query_order", "query_refund", "search_knowledge", "human_handoff"),
+    "QueryTicket": ("list_orders", "query_ticket", "search_knowledge", "human_handoff"),
     "VoucherUnavailable": (
         "list_orders",
         "query_order",
         "query_voucher",
         "query_store",
+        "search_knowledge",
         "run_diagnosis",
         "regenerate_qr",
         "contact_merchant",
@@ -120,16 +141,26 @@ _INTENT_TOOL_SETS: dict[str, tuple[str, ...]] = {
         "list_orders",
         "query_order",
         "query_voucher",
+        "search_knowledge",
         "run_diagnosis",
         "contact_merchant",
         "human_handoff",
     ),
-    "RefundRequest": ("list_orders", "query_order", "query_refund", "run_diagnosis", "apply_refund", "human_handoff"),
-    "StoreUnavailable": ("list_orders", "query_order", "query_store", "run_diagnosis", "human_handoff"),
+    "RefundRequest": (
+        "list_orders",
+        "query_order",
+        "query_refund",
+        "search_knowledge",
+        "run_diagnosis",
+        "apply_refund",
+        "human_handoff",
+    ),
+    "StoreUnavailable": ("list_orders", "query_order", "query_store", "search_knowledge", "run_diagnosis", "human_handoff"),
     "ReservationFailure": (
         "list_orders",
         "query_order",
         "query_store",
+        "search_knowledge",
         "create_reservation",
         "run_diagnosis",
         "human_handoff",
@@ -143,6 +174,7 @@ _DEFAULT_TOOLS: tuple[str, ...] = (
     "query_voucher",
     "query_store",
     "query_refund",
+    "search_knowledge",
     "run_diagnosis",
     "human_handoff",
 )
@@ -161,6 +193,7 @@ def tools_for_intent(intent: str | None) -> list[str]:
                 [
                     "list_orders",
                     "query_order",
+                    "search_knowledge",
                     "run_diagnosis",
                     "human_handoff",
                     "contact_merchant",

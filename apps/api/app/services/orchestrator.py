@@ -11,6 +11,7 @@ from app.models.entities import ConversationEvent
 from app.repositories.life_service import OperationLogRepository
 from app.schemas.api import ChatRequest, EdgeContextPacket
 from app.services.context import ServiceContextBuilder
+from app.services.error_recovery import ErrorRecoveryService
 from app.services.fulfillment_agent import FulfillmentAgent
 from app.services.llm import LLMService
 from app.services.sessions import SessionStore
@@ -24,6 +25,7 @@ class ChatOrchestrator:
         self.context_builder = ServiceContextBuilder()
         self.operation_logs = OperationLogRepository()
         self.llm = LLMService()
+        self.recovery = ErrorRecoveryService(self.llm)
 
     async def run_stream(
         self,
@@ -75,54 +77,94 @@ class ChatOrchestrator:
         yield "pipeline", pipeline_payload()
 
         agent_result = None
-        async for event, payload in self.agent.run_stream(
-            db,
-            store,
-            session_id=session_id,
-            user_id=user_id,
-            message=body.message,
-            edge=edge,
-            history=history,
-            service_context=service_context,
-            on_step=on_react_step,
-        ):
-            if event == "context_ready":
-                intent = payload.get("intent", intent)
-                intent_meta = payload.get("intent_meta") or {}
-                focus_order_id = payload.get("focus_order_id") or focus_order_id
-                step(
-                    "intent_detect",
-                    f"[{intent_meta.get('route_category', '?')}] {intent} "
-                    f"({int((intent_meta.get('confidence') or 0) * 100)}%, agent)",
-                )
-                titles = payload.get("knowledge_titles") or []
-                step("knowledge_search", ", ".join(titles[:3]) if titles else "0 articles")
-                yield "pipeline", pipeline_payload()
-            elif event == "react_step":
-                trace_step = payload.get("step") or {}
-                focus_order_id = payload.get("focus_order_id") or focus_order_id
-                action = trace_step.get("action", "?")
-                thought = str(trace_step.get("thought") or "")[:80]
-                step("agent_react", f"#{trace_step.get('step', '?')} {action}: {thought}")
-                yield "pipeline", pipeline_payload()
-            elif event == "thinking":
-                yield "thinking", payload
-            elif event == "agent":
-                intent = payload.get("intent", intent)
-                intent_meta = payload.get("intent_meta") or {}
-                focus_order_id = payload.get("focus_order_id") or focus_order_id
-                agent_finish = payload.get("finish") or {}
-                if agent_finish.get("mode") == "clarify":
-                    step("agent_decision", "clarify — 大模型判断需先澄清")
-                else:
-                    step("agent_decision", f"reply — safe={agent_finish.get('safe_to_send', True)}")
-                step("tool_action", f"{payload.get('tool_count', 0)} calls via ReAct")
-                yield "pipeline", pipeline_payload()
-            elif event == "token":
-                yield "token", payload
-            elif event == "result":
-                agent_result = payload
-                agent_finish = agent_result.finish.to_dict()
+        try:
+            async for event, payload in self.agent.run_stream(
+                db,
+                store,
+                session_id=session_id,
+                user_id=user_id,
+                message=body.message,
+                edge=edge,
+                history=history,
+                service_context=service_context,
+                on_step=on_react_step,
+            ):
+                if event == "context_ready":
+                    intent = payload.get("intent", intent)
+                    intent_meta = payload.get("intent_meta") or {}
+                    focus_order_id = payload.get("focus_order_id") or focus_order_id
+                    step(
+                        "intent_detect",
+                        f"[{intent_meta.get('route_category', '?')}] {intent} "
+                        f"({int((intent_meta.get('confidence') or 0) * 100)}%, agent)",
+                    )
+                    titles = payload.get("knowledge_titles") or []
+                    step("knowledge_search", ", ".join(titles[:3]) if titles else "按需 search_knowledge")
+                    yield "pipeline", pipeline_payload()
+                elif event == "react_step":
+                    trace_step = payload.get("step") or {}
+                    focus_order_id = payload.get("focus_order_id") or focus_order_id
+                    action = trace_step.get("action", "?")
+                    thought = str(trace_step.get("thought") or "")[:80]
+                    step("agent_react", f"#{trace_step.get('step', '?')} {action}: {thought}")
+                    yield "pipeline", pipeline_payload()
+                elif event == "thinking":
+                    yield "thinking", payload
+                elif event == "agent":
+                    intent = payload.get("intent", intent)
+                    intent_meta = payload.get("intent_meta") or {}
+                    focus_order_id = payload.get("focus_order_id") or focus_order_id
+                    agent_finish = payload.get("finish") or {}
+                    if agent_finish.get("mode") == "clarify":
+                        step("agent_decision", "clarify — 大模型判断需先澄清")
+                    else:
+                        step("agent_decision", f"reply — safe={agent_finish.get('safe_to_send', True)}")
+                    step("tool_action", f"{payload.get('tool_count', 0)} calls via ReAct")
+                    yield "pipeline", pipeline_payload()
+                elif event == "token":
+                    yield "token", payload
+                elif event == "result":
+                    agent_result = payload
+                    agent_finish = agent_result.finish.to_dict()
+        except Exception as exc:
+            step("error_recovery", str(exc)[:120], status="warning")
+            yield "pipeline", pipeline_payload()
+            async for event, payload in self.recovery.recover_stream(
+                exc,
+                message=body.message,
+                service_context=service_context,
+                history=history,
+                session_id=session_id,
+                partial_trace=agent_trace,
+            ):
+                if event == "thinking":
+                    yield "thinking", payload
+                elif event == "pipeline":
+                    yield "pipeline", payload
+                elif event == "token":
+                    yield "token", payload
+                elif event == "done":
+                    reply = payload.get("reply", "")
+                    step("model_response", f"recovery {round(time.perf_counter() - started, 2)}s")
+                    pipeline["model"] = {"mode": self.llm.mode, "latency_s": round(time.perf_counter() - started, 2)}
+                    await self._persist_turn(
+                        db,
+                        store,
+                        session_id=session_id,
+                        user_id=user_id,
+                        body=body,
+                        edge=edge,
+                        reply=reply,
+                        intent=payload.get("intent", "clarify"),
+                        intent_meta=payload.get("intent_meta") or {},
+                        focus_order_id=payload.get("focus_order_id"),
+                        agent_trace=[],
+                        agent_finish=payload.get("agent_finish") or {},
+                        tool_calls=[],
+                        pipeline=pipeline,
+                    )
+                    yield "done", payload
+            return
 
         if agent_result is None:
             raise RuntimeError("Agent 未返回结果")
@@ -136,6 +178,59 @@ class ChatOrchestrator:
         reply = agent_result.finish.draft_message
         pipeline["model"] = {"mode": self.llm.mode, "latency_s": round(time.perf_counter() - started, 2)}
 
+        await self._persist_turn(
+            db,
+            store,
+            session_id=session_id,
+            user_id=user_id,
+            body=body,
+            edge=edge,
+            reply=reply,
+            intent=intent,
+            intent_meta=intent_meta,
+            focus_order_id=focus_order_id,
+            agent_trace=agent_trace,
+            agent_finish=agent_finish,
+            tool_calls=tool_calls,
+            pipeline=pipeline,
+            workflow_payload=workflow_payload,
+        )
+
+        yield "done", {
+            "session_id": session_id,
+            "reply": reply,
+            "intent": intent,
+            "intent_meta": intent_meta,
+            "pipeline": pipeline,
+            "service_cards": self._cards(service_context),
+            "tool_calls": tool_calls,
+            "workflow": workflow_payload,
+            "case": workflow_payload,
+            "focus_order_id": focus_order_id,
+            "agent_trace": agent_trace,
+            "agent_finish": agent_finish,
+            "pending_confirmations": [p.to_dict() for p in agent_result.pending_confirmations],
+        }
+
+    async def _persist_turn(
+        self,
+        db: AsyncSession,
+        store: SessionStore,
+        *,
+        session_id: str,
+        user_id: str,
+        body: ChatRequest,
+        edge: EdgeContextPacket,
+        reply: str,
+        intent: str,
+        intent_meta: dict,
+        focus_order_id: str | None,
+        agent_trace: list,
+        agent_finish: dict,
+        tool_calls: list,
+        pipeline: dict,
+        workflow_payload: dict | None = None,
+    ) -> None:
         await store.append_message(session_id, "user", body.message)
         await self._log(
             db,
@@ -186,22 +281,6 @@ class ChatOrchestrator:
             reply[:120],
             {"intent": intent, "case_id": workflow_payload.get("case_id") if workflow_payload else None},
         )
-
-        yield "done", {
-            "session_id": session_id,
-            "reply": reply,
-            "intent": intent,
-            "intent_meta": intent_meta,
-            "pipeline": pipeline,
-            "service_cards": self._cards(service_context),
-            "tool_calls": tool_calls,
-            "workflow": workflow_payload,
-            "case": workflow_payload,
-            "focus_order_id": focus_order_id,
-            "agent_trace": agent_trace,
-            "agent_finish": agent_finish,
-            "pending_confirmations": [p.to_dict() for p in agent_result.pending_confirmations],
-        }
 
     async def run_once(self, db: AsyncSession, store: SessionStore, body: ChatRequest) -> dict:
         result = None

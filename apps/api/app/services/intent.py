@@ -89,7 +89,7 @@ class IntentResult:
 
 _KEYWORD_RULES: list[tuple[str, tuple[str, ...], float]] = [
     ("SafetyComplaint", ("食品安全", "吃坏", "中毒", "异物", "变质", "被骚扰", "被威胁", "不安全", "偷拍"), 0.95),
-    ("MerchantReject", ("老板不给", "商家拒绝", "不给核销", "说不认", "活动结束", "平台券不能用", "不让核销"), 0.88),
+    ("MerchantReject", ("老板不给", "商家拒绝", "不给核销", "说不认", "活动结束", "平台券不能用", "不让核销", "不让我核销"), 0.88),
     ("VoucherUnavailable", ("核销失败", "扫不出来", "刷不出来", "券用不了", "扫不了"), 0.87),
     ("StoreUnavailable", ("关门", "没开门", "倒闭", "暂停营业", "打不通", "电话没人接"), 0.84),
     ("ServiceMismatch", ("缩水", "少给", "不一样", "缺货", "缺菜", "货不对板"), 0.86),
@@ -109,6 +109,18 @@ _KEYWORD_RULES: list[tuple[str, tuple[str, ...], float]] = [
     ("HumanTransfer", ("人工", "投诉", "客服", "真人"), 0.9),
     ("chitchat", ("你好", "谢谢", "在吗", "哈哈", "早上好"), 0.75),
 ]
+
+
+def preview_intent_for_retrieval(message: str) -> str:
+    """同步关键词预判，供知识库检索与意图 LLM 并行时使用。"""
+    kw = _keyword_classify(message)
+    if kw.route_category == "chitchat":
+        return "clarify"
+    return kw.route_intent
+
+
+def should_prefetch_knowledge(message: str) -> bool:
+    return _keyword_classify(message).route_category != "chitchat"
 
 
 def _keyword_classify(message: str) -> IntentResult:

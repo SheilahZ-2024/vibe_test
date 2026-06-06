@@ -20,6 +20,7 @@ from app.schemas.api import (
     WelcomeRequest,
 )
 from app.services.llm import LLMService
+from app.services.error_recovery import ErrorRecoveryService
 from app.services.orchestrator import ChatOrchestrator
 from app.services.sessions import SessionStore
 from app.services.tools import LifeServiceTools
@@ -31,6 +32,7 @@ tools = LifeServiceTools()
 welcome_service = WelcomeService()
 users_repo = UserRepository()
 llm = LLMService()
+recovery = ErrorRecoveryService(llm)
 
 
 def get_redis() -> aioredis.Redis:
@@ -86,7 +88,13 @@ async def chat_stream(
             async for event, payload in orchestrator.run_stream(db, store, body):
                 yield {"event": event, "data": json.dumps(payload, ensure_ascii=False)}
         except Exception as exc:
-            yield {"event": "error", "data": json.dumps({"message": str(exc)}, ensure_ascii=False)}
+            async for event, payload in recovery.recover_stream(
+                exc,
+                message=body.message,
+                service_context=None,
+                session_id=body.session_id or "",
+            ):
+                yield {"event": event, "data": json.dumps(payload, ensure_ascii=False)}
         finally:
             await redis.aclose()
 

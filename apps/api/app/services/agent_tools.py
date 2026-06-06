@@ -8,7 +8,9 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.diagnosis import DiagnosisEngine
+from app.repositories.life_service import KnowledgeRepository
 from app.services.agent_state import AgentState, PendingWriteAction
+from app.services.error_recovery import tool_error_payload
 from app.services.tool_catalog import TOOL_CATALOG, TOOL_TO_ACTION_ID, WRITE_ACTION_TITLES, WRITE_TOOLS
 from app.services.tools import LifeServiceTools
 
@@ -35,8 +37,28 @@ class AgentToolExecutor:
     def __init__(self, tools: LifeServiceTools | None = None):
         self.tools = tools or LifeServiceTools()
         self.engine = DiagnosisEngine()
+        self.knowledge = KnowledgeRepository()
 
     async def execute(
+        self,
+        db: AsyncSession,
+        state: AgentState,
+        tool_name: str,
+        action_input: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            return await self._execute_inner(db, state, tool_name, action_input)
+        except Exception as exc:
+            return _compact(
+                tool_error_payload(
+                    tool_name,
+                    exc,
+                    message=state.message,
+                    service_context=state.service_context,
+                )
+            )
+
+    async def _execute_inner(
         self,
         db: AsyncSession,
         state: AgentState,
@@ -105,6 +127,51 @@ class AgentToolExecutor:
         if tool_name == "query_ticket":
             result = await self.tools.query_ticket(db, user_id, session_id)
             return _compact({"ok": True, **result})
+
+        if tool_name == "search_knowledge":
+            query = str(args.get("query") or state.message or "").strip()
+            if not query:
+                return {"ok": False, "error": "search_knowledge 需要 query 或用户消息"}
+            try:
+                limit = int(args.get("limit") or 3)
+            except (TypeError, ValueError):
+                limit = 3
+            limit = max(1, min(5, limit))
+            intent_hint = str(args.get("intent") or state.intent_result.route_intent or "").strip()
+            if intent_hint in ("clarify", "chitchat", "unconfigured"):
+                intent_hint = ""
+            order_titles = [str(o.get("title") or "") for o in state.service_context.get("orders") or []]
+            hits = await self.knowledge.search_contextual(
+                db,
+                query,
+                intent=intent_hint or None,
+                order_titles=order_titles,
+                limit=limit,
+            )
+            seen = {getattr(a, "id", None) for a in state.knowledge_articles}
+            for article in hits:
+                if getattr(article, "id", None) not in seen:
+                    state.knowledge_articles.append(article)
+                    seen.add(article.id)
+            content_limit = 220
+            articles_out = [
+                {
+                    "title": a.title,
+                    "category": a.category,
+                    "content": a.content if len(a.content) <= content_limit else a.content[:content_limit] + "…",
+                }
+                for a in hits
+            ]
+            return _compact(
+                {
+                    "ok": True,
+                    "query": query,
+                    "limit": limit,
+                    "count": len(articles_out),
+                    "articles": articles_out,
+                    "total_cached": len(state.knowledge_articles),
+                }
+            )
 
         if tool_name == "run_diagnosis":
             intent = str(args.get("intent") or state.intent_result.route_intent or "").strip()

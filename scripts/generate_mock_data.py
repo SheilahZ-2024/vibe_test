@@ -173,13 +173,26 @@ ANOMALY_DEFS: dict[str, dict] = {
 
 USAGE_RULES: dict[str, str] = {
     "must_reserve": "须提前预约成功后方可到店核销，未预约不可使用。",
+    "walk_in": "无需预约，营业时间内凭券码直接到店核销。",
     "weekend_only": "仅限周六、周日使用，工作日不可核销。",
     "lunch_only": "仅限每日 11:00-14:00 午市使用，其他时段不可核销。",
     "no_refund": "本商品为特价促销款，标注「不可退」；未核销亦不支持自助退款。",
     "expired_no_refund": "已过期；本商品不支持过期退，无法自助退款。",
     "expired_unused": "已过期不可核销；标注过期退的商品可按平台规则处理。",
-    "default": "需按订单规则预约或到店核销，不可与其他优惠叠加。",
+    "default": "按商品详情页说明使用；具体是否需预约以券面规则为准。",
 }
+
+
+def _store_reservation_policy(i: int, scenario: str, spec: dict) -> tuple[bool, str]:
+    """门店级预约策略：与 service_type 解耦，约一半需预约、一半随到随用。"""
+    if spec.get("usage_rule_key") == "must_reserve" or spec.get("supports_reservation"):
+        return True, str(spec.get("usage_rule_key") or "must_reserve")
+    if scenario in ANOMALY_DEFS:
+        return False, str(spec.get("usage_rule_key") or "walk_in")
+    # 常规样本：奇数店需预约，偶数店无需预约
+    if i % 2 == 1:
+        return True, "must_reserve"
+    return False, "walk_in"
 
 
 def esc(value: str) -> str:
@@ -188,10 +201,6 @@ def esc(value: str) -> str:
 
 def sql_json(data: dict) -> str:
     return esc(json.dumps(data, ensure_ascii=False))
-
-
-def service_type_needs_reservation(i: int) -> bool:
-    return SERVICE_TYPES[i % len(SERVICE_TYPES)] in ("团购套餐", "预约服务", "酒店套餐")
 
 
 def _voucher_status(order_status: str, scenario: str) -> str:
@@ -208,9 +217,9 @@ def _voucher_status(order_status: str, scenario: str) -> str:
     }.get(order_status, "unused")
 
 
-def _usage_rule(scenario: str) -> str:
+def _usage_rule(scenario: str, store_rule_key: str | None = None) -> str:
     spec = ANOMALY_DEFS.get(scenario, {})
-    key = spec.get("usage_rule_key")
+    key = spec.get("usage_rule_key") or store_rule_key
     if key and key in USAGE_RULES:
         return USAGE_RULES[key]
     if scenario == "expired_unused":
@@ -226,10 +235,8 @@ def _build_store(i: int, scenario: str) -> tuple:
     store_name = f"{merchant}{spec.get('suffix', f'·{city}店')}"
     meta: dict = {"business_status": "open"}
     meta.update(spec.get("store_meta") or {})
-    hours = spec.get("business_hours") or random.choice(["10:00-22:00", "09:30-24:00", "11:00-23:00"])
-    supports_res = bool(spec.get("supports_reservation")) or (
-        not spec and service_type_needs_reservation(i)
-    )
+    hours = spec.get("business_hours") or random.choice(["10:00-22:00", "09:30-23:59", "11:00-23:00"])
+    supports_res, rule_key = _store_reservation_policy(i, scenario, spec)
     address = f"{city}市示例区示例路 {i} 号"
     if scenario == "anomaly_store_relocated":
         address = f"{city}市示例区新路 {i} 号"
@@ -244,6 +251,7 @@ def _build_store(i: int, scenario: str) -> tuple:
         f"010-{random.randint(10000000, 99999999)}",
         supports_res,
         meta,
+        rule_key,
     )
 
 
@@ -289,6 +297,7 @@ def _build_anomaly_order(i: int, user_id: str, store: tuple, scenario: str, serv
         can_reschedule,
         meta,
         scenario,
+        str(store[10]),
     )
 
 
@@ -296,6 +305,8 @@ def _build_order(i: int, user_id: str, store: tuple, scenario: str) -> tuple:
     service_type = SERVICE_TYPES[i % len(SERVICE_TYPES)]
     paid = round(random.uniform(39, 399), 2)
     original = round(paid * random.uniform(1.1, 1.6), 2)
+    store_requires_res = bool(store[8])
+    store_rule_key = str(store[10])
 
     if scenario in ANOMALY_DEFS:
         return _build_anomaly_order(i, user_id, store, scenario, service_type, paid, original)
@@ -311,21 +322,26 @@ def _build_order(i: int, user_id: str, store: tuple, scenario: str) -> tuple:
         service_time = NOW + timedelta(hours=random.randint(2, 48))
         expire = purchase + timedelta(days=random.randint(14, 45))
         can_refund = True
-        meta = {"reservation_confirmed": True, "appointment": service_time.isoformat()}
+        if store_requires_res:
+            meta = {"reservation_confirmed": True, "appointment": service_time.isoformat()}
+        else:
+            meta = {}
 
     elif scenario == "verified_recent":
         status = "used"
         purchase = NOW - timedelta(days=random.randint(2, 7))
         service_time = NOW - timedelta(hours=random.randint(2, 48))
         expire = purchase + timedelta(days=random.randint(14, 45))
-        can_refund, meta = False, {"reservation_confirmed": True}
+        can_refund = False
+        meta = {"reservation_confirmed": True} if store_requires_res else {}
 
     elif scenario == "completed_earlier":
         status = "used"
         purchase = NOW - timedelta(days=random.randint(14, 45))
         service_time = purchase + timedelta(days=random.randint(3, 10))
         expire = purchase + timedelta(days=random.randint(30, 60))
-        can_refund, meta = False, {"reservation_confirmed": True}
+        can_refund = False
+        meta = {"reservation_confirmed": True} if store_requires_res else {}
 
     elif scenario == "expired_unused":
         status = "expired"
@@ -338,7 +354,8 @@ def _build_order(i: int, user_id: str, store: tuple, scenario: str) -> tuple:
         purchase = NOW - timedelta(days=random.randint(3, 10))
         service_time = purchase + timedelta(days=1)
         expire = purchase + timedelta(days=30)
-        can_refund, meta = False, {"reservation_confirmed": True}
+        can_refund = False
+        meta = {"reservation_confirmed": True} if store_requires_res else {}
 
     elif scenario == "refunded":
         status, purchase = "refunded", NOW - timedelta(days=random.randint(5, 20))
@@ -370,6 +387,7 @@ def _build_order(i: int, user_id: str, store: tuple, scenario: str) -> tuple:
         can_reschedule,
         meta,
         scenario,
+        store_rule_key,
     )
 
 
@@ -539,7 +557,7 @@ def main() -> None:
                 _voucher_status(o[5], scenario),
                 o[8],
                 o[10],
-                _usage_rule(scenario),
+                _usage_rule(scenario, o[15]),
             )
         )
     lines += [
