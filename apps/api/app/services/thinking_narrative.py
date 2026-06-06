@@ -21,6 +21,7 @@ _STRIP_PATTERNS = [
 _TOOL_PHRASES: dict[str, str] = {
     "list_orders": "列出您的全部订单",
     "query_order": "查询订单详情",
+    "query_focus_bundle": "并行查询订单、券与门店",
     "query_voucher": "查询团购券状态",
     "query_store": "查询门店营业信息",
     "query_coupon": "查询优惠券",

@@ -6,7 +6,7 @@ from app.config import settings
 from app.diagnosis.storybook import oral_expression_guidance
 from app.services.agent_state import AgentState, AgentTraceStep
 from app.services.context import context_summary_for_agent
-from app.services.diagnosis_rules import DIAGNOSIS_TREE_RULES, DUAL_REFERENCE_MODEL
+from app.services.diagnosis_rules import prompt_rules_block, should_include_oral_guidance
 from app.services.intent import IntentResult
 from app.services.tool_catalog import tool_catalog_block
 
@@ -29,27 +29,26 @@ REACT_CONTINUATION_HEADER = """继续 ReAct，输出下一步 JSON（格式同�
 
 def build_react_system_prompt(state: AgentState, history: list[dict], *, step_idx: int = 1) -> str:
     intent = state.intent_result
-    route_intent = intent.route_intent
 
     if step_idx > 1:
         return _build_react_continuation_prompt(state)
 
     knowledge = _knowledge_block(state.knowledge_articles)
-    return f"""{AGENT_MISSION}
+    rules = prompt_rules_block(intent.route_intent, intent.route_category)
+    oral = oral_expression_guidance() if should_include_oral_guidance(intent.route_intent, intent.route_category) else ""
+    oral_block = f"\n{oral}\n" if oral else ""
 
-{DUAL_REFERENCE_MODEL}
+    return f"""{AGENT_MISSION}
 
 {REACT_OUTPUT_SCHEMA}
 
 ── 意图（可参考/修正）──
 {_intent_guidance(intent)}
-
-{oral_expression_guidance()}
-
-{DIAGNOSIS_TREE_RULES}
+{oral_block}
+{rules}
 
 ── 可用工具 ──
-{tool_catalog_block(intent=route_intent)}
+{tool_catalog_block(intent=intent.route_intent)}
 
 ── 聚焦订单 ──
 {state.focus_order_id or "未选；多订单时 list_orders 或 finish clarify"}

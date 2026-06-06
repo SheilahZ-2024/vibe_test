@@ -23,6 +23,14 @@ TOOL_CATALOG: dict[str, dict] = {
         "parameters": {"order_id": "string，必填"},
         "read_only": True,
     },
+    "query_focus_bundle": {
+        "description": (
+            "一次并行拉取聚焦订单+关联券+门店（等同 query_order+query_voucher+query_store）。"
+            "已有聚焦 order_id 时优先用此工具，减少往返步数。"
+        ),
+        "parameters": {"order_id": "string 可选，默认当前聚焦订单"},
+        "read_only": True,
+    },
     "query_coupon": {
         "description": "查询用户优惠券列表与可用性。",
         "parameters": {},
@@ -117,6 +125,7 @@ _INTENT_TOOL_SETS: dict[str, tuple[str, ...]] = {
     "QueryStore": ("list_orders", "query_order", "query_store", "search_knowledge", "human_handoff"),
     "QueryReservation": (
         "list_orders",
+        "query_focus_bundle",
         "query_order",
         "query_store",
         "search_knowledge",
@@ -128,6 +137,7 @@ _INTENT_TOOL_SETS: dict[str, tuple[str, ...]] = {
     "QueryTicket": ("list_orders", "query_ticket", "search_knowledge", "human_handoff"),
     "VoucherUnavailable": (
         "list_orders",
+        "query_focus_bundle",
         "query_order",
         "query_voucher",
         "query_store",
@@ -139,6 +149,7 @@ _INTENT_TOOL_SETS: dict[str, tuple[str, ...]] = {
     ),
     "MerchantReject": (
         "list_orders",
+        "query_focus_bundle",
         "query_order",
         "query_voucher",
         "search_knowledge",
@@ -155,9 +166,18 @@ _INTENT_TOOL_SETS: dict[str, tuple[str, ...]] = {
         "apply_refund",
         "human_handoff",
     ),
-    "StoreUnavailable": ("list_orders", "query_order", "query_store", "search_knowledge", "run_diagnosis", "human_handoff"),
+    "StoreUnavailable": (
+        "list_orders",
+        "query_focus_bundle",
+        "query_order",
+        "query_store",
+        "search_knowledge",
+        "run_diagnosis",
+        "human_handoff",
+    ),
     "ReservationFailure": (
         "list_orders",
+        "query_focus_bundle",
         "query_order",
         "query_store",
         "search_knowledge",
@@ -170,6 +190,7 @@ _INTENT_TOOL_SETS: dict[str, tuple[str, ...]] = {
 
 _DEFAULT_TOOLS: tuple[str, ...] = (
     "list_orders",
+    "query_focus_bundle",
     "query_order",
     "query_voucher",
     "query_store",

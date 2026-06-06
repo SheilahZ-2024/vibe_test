@@ -10,6 +10,7 @@ import { PlusMenu, type PlusMenuTarget } from "./components/PlusMenu";
 import { PrivacySettings } from "./components/PrivacySettings";
 import { ThinkingStream } from "./components/ThinkingStream";
 import { appendThinkingLine, formatThinkingDisplay } from "./lib/thinking";
+import { reservationLabel } from "./lib/reservation";
 import { getStoredFocusOrderId, resolveFocusOrderId, setStoredFocusOrderId } from "./lib/orderFocus";
 import { getStoredUserId, resolveUserId, setStoredUserId } from "./lib/userSession";
 import type { Message, PendingWriteAction, PrivacySettings as Settings, ServiceCard, ServiceContext, UserListItem, WorkflowDiagnosis, WorkflowSolution } from "./types";
@@ -785,6 +786,7 @@ function DetailContent({
             rows={[
               ["券码", text(voucher?.code)],
               ["状态", text(voucher?.status)],
+              ["预约", reservationLabel(voucher?.usage_rule) || "—"],
               ["有效期", text(voucher?.valid_to)],
               ["规则", text(voucher?.usage_rule)],
             ]}

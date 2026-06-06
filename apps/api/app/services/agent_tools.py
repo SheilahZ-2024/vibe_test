@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -115,6 +116,30 @@ class AgentToolExecutor:
         if tool_name == "query_store":
             result = await self.tools.query_store(db, user_id, str(focus))
             return _compact({"ok": result.get("found", False), **result})
+
+        if tool_name == "query_focus_bundle":
+            order_id = str(args.get("order_id") or state.focus_order_id or "")
+            if not order_id:
+                return {"ok": False, "error": "缺少 order_id：请先 list_orders 或让用户聚焦订单"}
+            vouchers = state.service_context.get("vouchers") or []
+            match = next((v for v in vouchers if str(v.get("order_id")) == order_id), None)
+            voucher_id = str(match.get("id")) if match else None
+            order_res, voucher_res, store_res = await asyncio.gather(
+                self.tools.query_order(db, user_id, order_id),
+                self.tools.query_voucher(db, user_id, voucher_id),
+                self.tools.query_store(db, user_id, order_id),
+            )
+            if order_res.get("found") and order_res.get("order"):
+                state.focus_order_id = str(order_res["order"].get("id") or order_id)
+            return _compact(
+                {
+                    "ok": True,
+                    "parallel": True,
+                    "order": order_res,
+                    "voucher": voucher_res,
+                    "store": store_res,
+                }
+            )
 
         if tool_name == "query_coupon":
             result = await self.tools.query_coupon(db, user_id)

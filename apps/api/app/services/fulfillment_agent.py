@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
@@ -236,10 +237,12 @@ class FulfillmentAgent:
 
         finish: AgentFinishDecision | None = None
         for step_idx in range(1, settings.agent_max_steps + 1):
+            step_started = time.perf_counter()
             if step_idx == 1:
                 yield "thinking", {"line": "进入分步推理：先拿系统里的真实数据，再决定怎么帮您"}
             system = build_react_system_prompt(state, history, step_idx=step_idx)
             user_block = f"用户最新：{state.message}\n\n请输出下一步 JSON。"
+            llm_started = time.perf_counter()
             raw = await self.llm.complete_with_history(
                 system,
                 history if step_idx == 1 else [],
@@ -247,6 +250,7 @@ class FulfillmentAgent:
                 temperature=settings.agent_react_temperature,
                 max_tokens=settings.agent_react_max_tokens,
             )
+            llm_latency_ms = int((time.perf_counter() - llm_started) * 1000)
             if not raw:
                 finish = self._fallback_finish(state, "LLM 无响应，进入澄清")
                 break
@@ -268,7 +272,9 @@ class FulfillmentAgent:
                 state.trace.append(trace)
                 if on_step:
                     on_step(trace, state)
-                yield "react_step", self._react_step_payload(trace, state)
+                yield "react_step", self._react_step_payload(
+                    trace, state, llm_latency_ms=llm_latency_ms, step_latency_ms=int((time.perf_counter() - step_started) * 1000)
+                )
                 for kind, payload in _emit_thinking(
                     build_finish_thought_lines(
                         thought=thought,
@@ -291,9 +297,12 @@ class FulfillmentAgent:
                 state.trace.append(trace)
                 if on_step:
                     on_step(trace, state)
-                yield "react_step", self._react_step_payload(trace, state)
+                yield "react_step", self._react_step_payload(
+                    trace, state, llm_latency_ms=llm_latency_ms, step_latency_ms=int((time.perf_counter() - step_started) * 1000)
+                )
                 continue
 
+            tool_started = time.perf_counter()
             for kind, payload in _emit_thinking(
                 build_pre_action_thought_lines(
                     thought=thought,
@@ -310,7 +319,14 @@ class FulfillmentAgent:
             state.trace.append(trace)
             if on_step:
                 on_step(trace, state)
-            yield "react_step", self._react_step_payload(trace, state)
+            tool_latency_ms = int((time.perf_counter() - tool_started) * 1000)
+            yield "react_step", self._react_step_payload(
+                trace,
+                state,
+                llm_latency_ms=llm_latency_ms,
+                tool_latency_ms=tool_latency_ms,
+                step_latency_ms=int((time.perf_counter() - step_started) * 1000),
+            )
             for kind, payload in _emit_thinking(
                 build_post_action_thought_lines(
                     thought=thought,
@@ -371,14 +387,17 @@ class FulfillmentAgent:
         yield "complete", result
 
     @staticmethod
-    def _react_step_payload(trace: AgentTraceStep, state: AgentState) -> dict:
-        return {
+    def _react_step_payload(trace: AgentTraceStep, state: AgentState, **timing: int) -> dict:
+        payload = {
             "step": trace.to_dict(),
             "focus_order_id": state.focus_order_id,
             "trace_length": len(state.trace),
             "diagnosis_script_count": len(state.diagnosis_advisories),
             "pending_confirmations": [p.to_dict() for p in state.pending_confirmations],
         }
+        if timing:
+            payload["timing_ms"] = timing
+        return payload
 
     async def _mock_react(
         self,
@@ -441,22 +460,20 @@ class FulfillmentAgent:
         step_n += 1
 
         if state.focus_order_id:
-            qo = await self.tool_executor.execute(
-                db, state, "query_order", {"order_id": state.focus_order_id}
+            bundle = await self.tool_executor.execute(
+                db, state, "query_focus_bundle", {"order_id": state.focus_order_id}
             )
-            step = AgentTraceStep(step_n, "查询聚焦订单", "query_order", {"order_id": state.focus_order_id}, observation=qo)
-            state.trace.append(step)
-            state.tool_calls.append({"name": "query_order", "input": {"order_id": state.focus_order_id}, "result": qo})
-            if on_step:
-                on_step(step, state)
-            step_n += 1
-
-            qv = await self.tool_executor.execute(
-                db, state, "query_voucher", {"order_id": state.focus_order_id}
+            step = AgentTraceStep(
+                step_n,
+                "并行查询订单/券/门店",
+                "query_focus_bundle",
+                {"order_id": state.focus_order_id},
+                observation=bundle,
             )
-            step = AgentTraceStep(step_n, "查询关联券", "query_voucher", {"order_id": state.focus_order_id}, observation=qv)
             state.trace.append(step)
-            state.tool_calls.append({"name": "query_voucher", "input": {"order_id": state.focus_order_id}, "result": qv})
+            state.tool_calls.append(
+                {"name": "query_focus_bundle", "input": {"order_id": state.focus_order_id}, "result": bundle}
+            )
             if on_step:
                 on_step(step, state)
             step_n += 1

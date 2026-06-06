@@ -43,7 +43,39 @@ def requires_reservation(usage_rule: str, service_type: str, supports_reservatio
     rule = usage_rule or ""
     if any(k in rule for k in ("须预约", "提前预约", "预约成功", "未预约不可")):
         return True
+    if any(k in rule for k in ("无需预约", "随到随用", "直接到店")):
+        return False
     return supports_reservation and service_type in ("团购套餐", "预约服务", "酒店套餐")
+
+
+def has_reservation_record(order_metadata: dict | None) -> bool:
+    meta = order_metadata or {}
+    return bool(meta.get("reservation_confirmed") or meta.get("appointment"))
+
+
+def reservation_context(
+    *,
+    usage_rule: str = "",
+    service_type: str = "",
+    supports_reservation: bool = False,
+    order_metadata: dict | None = None,
+) -> dict:
+    """统一推导预约要求（与诊断引擎、履约时间线共用）。"""
+    needs = requires_reservation(usage_rule, service_type, supports_reservation)
+    has = has_reservation_record(order_metadata)
+    if not needs:
+        label, detail = "无需预约", "营业时间内凭券码直接到店核销"
+    elif has:
+        label, detail = "已预约", "已有有效预约记录"
+    else:
+        label, detail = "待预约", (usage_rule or "须提前预约成功后方可到店核销")[:120]
+    return {
+        "needs_reservation": needs,
+        "has_reservation": has,
+        "label": label,
+        "detail": detail,
+        "usage_rule": usage_rule,
+    }
 
 
 def voucher_allowed_at(usage_rule: str, at: datetime | None = None) -> tuple[bool, str]:

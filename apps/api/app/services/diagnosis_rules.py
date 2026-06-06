@@ -47,3 +47,63 @@ DIAGNOSIS_TREE_RULES = """
 - 脚本推荐动作不等于已执行；写操作须用户确认
 - 规则层推断与脚本 Case 不一致时，在 thought 中解释取舍
 """
+
+_VOUCHER_DIAGNOSIS_RULES = """
+核销受阻（VoucherUnavailable）判别节点 — 请结合 query 数据逐步核对：
+1. 订单/券是否存在 → 不存在则查支付/出单
+2. 券是否过期、是否已核销
+3. 门店是否匹配、是否营业、是否需预约且未预约（看 usage_rule + 订单 metadata）
+4. 商家是否拒核销（须与用户描述交叉验证）
+5. 系统/扫码异常（metadata 仅作线索）
+6. 任一步信息不足或与用户说法矛盾 → clarify，勿强行定 Case
+"""
+
+_QUERY_DIAGNOSIS_RULES = """
+查询类 / 售后类：
+- 先聚焦订单，再 query_order / query_voucher / query_refund
+- 预约问题：看券 usage_rule 是否「须预约」，订单 metadata 是否有 reservation_confirmed
+"""
+
+_CLARIFY_RULES = """
+── 规则（澄清/闲聊）──
+引导用户描述具体履约问题（订单、券码、核销、预约、退款）；勿编造订单事实。
+多订单时 list_orders 或 finish clarify。
+"""
+
+_DUAL_REFERENCE_COMPACT = """
+双轨参考：轨道 A=下方规则+query 事实；轨道 B=run_diagnosis 脚本（可选，须交叉验证）。
+你是裁判，任一路与 query 矛盾 → clarify 或继续 query。
+"""
+
+
+def prompt_rules_block(route_intent: str | None, route_category: str | None) -> str:
+    """按意图注入规则片段，避免每轮塞满整棵诊断树。"""
+    category = route_category or ""
+    intent = route_intent or ""
+
+    if category in ("chitchat", "unconfigured") or intent in ("clarify",):
+        return _CLARIFY_RULES
+
+    if intent in (
+        "VoucherUnavailable",
+        "MerchantReject",
+        "StoreUnavailable",
+        "ReservationFailure",
+        "QueryReservation",
+        "CheckReservationEligibility",
+    ):
+        return f"{_DUAL_REFERENCE_COMPACT}\n{_VOUCHER_DIAGNOSIS_RULES}\n何时可调用 run_diagnosis：聚焦订单且 query 后仍需 Case 对照。"
+
+    if intent.startswith("Query") or intent in ("RefundRequest", "QueryRefund", "HumanTransfer"):
+        return f"{_DUAL_REFERENCE_COMPACT}\n{_QUERY_DIAGNOSIS_RULES}"
+
+    return f"{_DUAL_REFERENCE_COMPACT}\n{DIAGNOSIS_TREE_RULES}"
+
+
+def should_include_oral_guidance(route_intent: str | None, route_category: str | None) -> bool:
+    if (route_category or "") in ("chitchat", "unconfigured"):
+        return False
+    intent = route_intent or ""
+    if intent in ("clarify",):
+        return True
+    return intent not in ("QueryOrder", "QueryCoupon", "QueryTicket", "QueryRefund")

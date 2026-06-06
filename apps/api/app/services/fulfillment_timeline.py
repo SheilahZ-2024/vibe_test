@@ -8,7 +8,8 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.entities import FulfillmentEvent, LifeOrder, RefundCase
+from app.models.entities import FulfillmentEvent, LifeOrder, MerchantStore, RefundCase, Voucher
+from app.services.usage_rules import reservation_context
 
 # 核销即视为套餐已使用，不再单独展示「消费」节点
 TIMELINE_STAGE_DEFS: list[dict[str, Any]] = [
@@ -53,14 +54,30 @@ async def build_order_timeline(db: AsyncSession, user_id: str, order_id: str) ->
     rq = select(RefundCase).where(RefundCase.order_id == order_id, RefundCase.user_id == user_id)
     refunds = list((await db.execute(rq)).scalars().all())
 
-    synthesized = _synthesize_events(order, events, refunds)
-    stages = _build_stages(order, synthesized, refunds)
+    vq = select(Voucher).where(Voucher.order_id == order_id, Voucher.user_id == user_id).limit(1)
+    voucher = (await db.execute(vq)).scalar_one_or_none()
+    store = await db.get(MerchantStore, order.store_id)
+    res_ctx = reservation_context(
+        usage_rule=str(voucher.usage_rule if voucher else ""),
+        service_type=str(order.service_type or ""),
+        supports_reservation=bool(store.supports_reservation if store else False),
+        order_metadata=order.metadata_ or {},
+    )
+
+    synthesized = _synthesize_events(order, events, refunds, res_ctx)
+    stages = _build_stages(order, synthesized, refunds, res_ctx)
 
     return {
         "order_id": order_id,
         "order_title": order.title,
         "order_status": order.status,
         "stages": stages,
+        "reservation": {
+            "needs_reservation": res_ctx["needs_reservation"],
+            "has_reservation": res_ctx["has_reservation"],
+            "label": res_ctx["label"],
+            "usage_rule": res_ctx.get("usage_rule"),
+        },
         "events": [
             {
                 "event_type": e.event_type,
@@ -73,9 +90,13 @@ async def build_order_timeline(db: AsyncSession, user_id: str, order_id: str) ->
     }
 
 
-def _build_stages(order: LifeOrder, events: list[FulfillmentEvent], refunds: list[RefundCase]) -> list[dict]:
-    meta = order.metadata_ or {}
-    needs_reservation = bool(meta.get("reservation_required"))
+def _build_stages(
+    order: LifeOrder,
+    events: list[FulfillmentEvent],
+    refunds: list[RefundCase],
+    res_ctx: dict,
+) -> list[dict]:
+    needs_reservation = bool(res_ctx.get("needs_reservation"))
     by_type: dict[str, FulfillmentEvent] = {}
     for ev in events:
         by_type[ev.event_type] = ev
@@ -89,9 +110,9 @@ def _build_stages(order: LifeOrder, events: list[FulfillmentEvent], refunds: lis
                     "key": key,
                     "title": spec["title"],
                     "state": "skipped",
-                    "label": "本套餐无需预约",
+                    "label": "无需预约",
                     "occurred_at": None,
-                    "detail": None,
+                    "detail": res_ctx.get("detail") or "营业时间内凭券码直接到店核销",
                 }
             )
             continue
@@ -104,7 +125,7 @@ def _build_stages(order: LifeOrder, events: list[FulfillmentEvent], refunds: lis
             stages.append(_stage_from_event(spec, ev))
             continue
 
-        inferred = _infer_stage(order, key, refunds)
+        inferred = _infer_stage(order, key, refunds, res_ctx)
         if inferred:
             stages.append({**spec, **inferred})
         elif spec.get("optional"):
@@ -115,7 +136,7 @@ def _build_stages(order: LifeOrder, events: list[FulfillmentEvent], refunds: lis
                     "state": "pending",
                     "label": "尚未发生",
                     "occurred_at": None,
-                    "detail": _pending_hint(key, order),
+                    "detail": _pending_hint(key, order, res_ctx),
                 }
             )
 
@@ -144,7 +165,7 @@ def _stage_from_event(spec: dict, ev: FulfillmentEvent) -> dict:
     }
 
 
-def _infer_stage(order: LifeOrder, key: str, refunds: list[RefundCase]) -> dict | None:
+def _infer_stage(order: LifeOrder, key: str, refunds: list[RefundCase], res_ctx: dict) -> dict | None:
     if key == "purchase":
         return {
             "key": key,
@@ -183,25 +204,39 @@ def _infer_stage(order: LifeOrder, key: str, refunds: list[RefundCase]) -> dict 
             "extra": {},
         }
 
-    if key == "reservation" and order.status in ("scheduled", "used") and order.service_time:
+    if key == "reservation" and res_ctx.get("needs_reservation"):
+        if res_ctx.get("has_reservation") or order.status in ("scheduled", "used"):
+            return {
+                "key": key,
+                "title": "预约到店",
+                "state": "done",
+                "label": "已预约",
+                "occurred_at": (order.service_time - timedelta(hours=2)).isoformat() if order.service_time else None,
+                "detail": f"预约到店时间 {order.service_time.strftime('%m-%d %H:%M') if order.service_time else '-'}",
+                "extra": {},
+            }
         return {
             "key": key,
             "title": "预约到店",
-            "state": "done",
-            "label": "已预约",
-            "occurred_at": (order.service_time - timedelta(hours=2)).isoformat() if order.service_time else None,
-            "detail": f"预约到店时间 {order.service_time.strftime('%m-%d %H:%M') if order.service_time else '-'}",
+            "state": "pending",
+            "label": "待预约",
+            "occurred_at": None,
+            "detail": str(res_ctx.get("detail") or "须提前预约成功后方可到店核销"),
             "extra": {},
         }
 
     return None
 
 
-def _pending_hint(key: str, order: LifeOrder) -> str:
+def _pending_hint(key: str, order: LifeOrder, res_ctx: dict) -> str:
     hints = {
         "arrive": "等待您到店",
         "verify": "待到店出示券码核销",
-        "reservation": "可在订单页发起预约",
+        "reservation": (
+            "须提前预约，可在对话中说「帮我预约」"
+            if res_ctx.get("needs_reservation")
+            else "本套餐无需预约"
+        ),
         "refund": "暂无售后",
     }
     return hints.get(key, "等待下一步")
@@ -211,6 +246,7 @@ def _synthesize_events(
     order: LifeOrder,
     existing: list[FulfillmentEvent],
     refunds: list[RefundCase],
+    res_ctx: dict,
 ) -> list[FulfillmentEvent]:
     """若 seed 数据不完整，按订单状态补全关键节点（带合理时间）。"""
     if existing and not _looks_like_placeholder(existing):
@@ -241,7 +277,12 @@ def _synthesize_events(
         )
     )
 
-    if meta.get("reservation_required") and order.status in ("scheduled", "used", "refunding", "refunded"):
+    if res_ctx.get("needs_reservation") and res_ctx.get("has_reservation") and order.status in (
+        "scheduled",
+        "used",
+        "refunding",
+        "refunded",
+    ):
         events.append(
             _ev(
                 "reservation",

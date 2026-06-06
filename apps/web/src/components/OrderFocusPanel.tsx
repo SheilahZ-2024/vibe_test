@@ -1,3 +1,5 @@
+import { reservationBadgeClass, reservationLabel } from "../lib/reservation";
+
 function text(value: unknown, fallback = "—") {
   return value == null ? fallback : String(value);
 }
@@ -48,6 +50,7 @@ export function OrderFocusPanel({
             const id = String(order.id);
             const selected = id === focusOrderId;
             const voucher = vouchers.find((v) => String(v.order_id) === id);
+            const resLabel = reservationLabel(voucher?.usage_rule);
             return (
               <li key={id}>
                 <button
@@ -70,9 +73,16 @@ export function OrderFocusPanel({
                     <span className={`block truncate text-sm ${selected ? "font-semibold text-[#fe2c55]" : "font-medium text-slate-800"}`}>
                       {text(order.title)}
                     </span>
-                    <span className="block truncate text-[10px] text-slate-500">
-                      {statusLabel(order.status)} · ¥{text(order.paid_amount)}
-                      {voucher?.code ? ` · 券 ${String(voucher.code)}` : ""}
+                    <span className="mt-0.5 flex flex-wrap items-center gap-1.5">
+                      <span className="truncate text-[10px] text-slate-500">
+                        {statusLabel(order.status)} · ¥{text(order.paid_amount)}
+                        {voucher?.code ? ` · 券 ${String(voucher.code)}` : ""}
+                      </span>
+                      {resLabel ? (
+                        <span className={`shrink-0 rounded-full px-1.5 py-0.5 text-[9px] font-semibold ${reservationBadgeClass(resLabel)}`}>
+                          {resLabel}
+                        </span>
+                      ) : null}
                     </span>
                   </span>
                 </button>

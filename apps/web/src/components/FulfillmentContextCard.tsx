@@ -1,13 +1,25 @@
-const journey = [
-  ["购买", "已支付"],
-  ["预约", "可预约"],
-  ["到店", "待到店"],
-  ["核销", "待处理"],
-  ["售后", "—"],
-];
+import { reservationLabel } from "../lib/reservation";
 
 function text(value: unknown, fallback = "—") {
   return value == null ? fallback : String(value);
+}
+
+function buildJourney(reservationLabelText: string, orderStatus?: string) {
+  let reservationDesc = reservationLabelText;
+  if (reservationLabelText === "须预约") {
+    reservationDesc = orderStatus === "scheduled" ? "已预约" : "待预约";
+  } else if (reservationLabelText === "无需预约") {
+    reservationDesc = "无需预约";
+  } else {
+    reservationDesc = "可预约";
+  }
+  return [
+    ["购买", "已支付"],
+    ["预约", reservationDesc],
+    ["到店", "待到店"],
+    ["核销", "待处理"],
+    ["售后", "—"],
+  ] as const;
 }
 
 export function FulfillmentContextCard({
@@ -16,6 +28,8 @@ export function FulfillmentContextCard({
   city,
   paidAmount,
   voucherCode,
+  usageRule,
+  orderStatus,
   statusLabel = "待核销",
   onOpenProgress,
   onOpenOrder,
@@ -25,10 +39,15 @@ export function FulfillmentContextCard({
   city?: string;
   paidAmount?: string;
   voucherCode?: string;
+  usageRule?: string;
+  orderStatus?: string;
   statusLabel?: string;
   onOpenProgress: () => void;
   onOpenOrder: () => void;
 }) {
+  const resLabel = reservationLabel(usageRule);
+  const journey = buildJourney(resLabel, orderStatus);
+
   return (
     <div className="rounded-2xl border border-slate-100 bg-gradient-to-br from-white to-slate-50 p-3 shadow-sm">
       <div className="flex items-start justify-between gap-2">
@@ -38,6 +57,7 @@ export function FulfillmentContextCard({
           <div className="mt-0.5 text-[10px] text-slate-500">
             {text(userName, "—")} · {text(city, "—")} · 实付 ¥{text(paidAmount, "—")}
             {voucherCode ? ` · 券码 ${voucherCode}` : ""}
+            {resLabel ? ` · ${resLabel}` : ""}
           </div>
         </button>
         <span className="shrink-0 rounded-full bg-[#fff1f3] px-2 py-0.5 text-[10px] font-semibold text-[#fe2c55]">

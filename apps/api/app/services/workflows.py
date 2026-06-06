@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from app.services.usage_rules import requires_reservation
 
 
 @dataclass
@@ -59,7 +59,7 @@ VOUCHER_FAILURE_CHECKS = [
     {
         "id": "reservation",
         "label": "预约要求",
-        "pass_when": lambda v, o, s: not _needs_reservation(o) or _has_reservation(o),
+        "pass_when": lambda v, o, s: not _needs_reservation(v, o, s) or _has_reservation(o),
         "fail_detail": lambda v, o, s: "套餐需提前预约，当前未检测到有效预约",
         "root_cause": "reservation_missing",
     },
@@ -112,11 +112,13 @@ def _meta(value: object | None) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-def _needs_reservation(order: dict | None) -> bool:
+def _needs_reservation(voucher: dict | None, order: dict | None, store: dict | None) -> bool:
     if not order:
         return False
-    meta = _meta(order.get("metadata"))
-    return bool(meta.get("reservation_required"))
+    usage_rule = str(voucher.get("usage_rule") or "") if voucher else ""
+    service_type = str(order.get("service_type") or "")
+    supports = bool(store.get("supports_reservation")) if store else False
+    return requires_reservation(usage_rule, service_type, supports)
 
 
 def _has_reservation(order: dict | None) -> bool:
