@@ -1,14 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { buildEdgeContext, createRefund, createSession, executeWorkflowAction, fetchHealth, fetchOperationLogs, fetchServiceContext, streamChat } from "./api/client";
+import { buildEdgeContext, createRefund, createSession, executeWorkflowAction, fetchFulfillmentTimeline, fetchHealth, fetchServiceContext, fetchServiceRecords, fetchUserSample, fetchWelcome, streamChat } from "./api/client";
+import { ServiceProgressPanel, ServiceRecordsPanel, type ServiceRecord, type TimelineStage } from "./components/ServicePanels";
 import { ActionSheet } from "./components/ActionSheet";
 import { BottomSheet } from "./components/BottomSheet";
-import { FulfillmentContextCard } from "./components/FulfillmentContextCard";
+import { DemoUserSwitcher, SAMPLE_SIZE } from "./components/DemoUserSwitcher";
+import { OrderFocusPanel } from "./components/OrderFocusPanel";
 import { PhoneShell } from "./components/PhoneShell";
 import { PlusMenu, type PlusMenuTarget } from "./components/PlusMenu";
 import { PrivacySettings } from "./components/PrivacySettings";
-import { ThinkingProcess } from "./components/ThinkingProcess";
-import { buildThinkingLines, summarizeWorkflow } from "./lib/thinking";
-import type { Message, PipelineStep, PrivacySettings as Settings, ServiceCard, ServiceContext, ToolCall, WorkflowDiagnosis, WorkflowSolution } from "./types";
+import { ThinkingStream } from "./components/ThinkingStream";
+import { appendThinkingLine, formatThinkingDisplay } from "./lib/thinking";
+import { getStoredFocusOrderId, resolveFocusOrderId, setStoredFocusOrderId } from "./lib/orderFocus";
+import { getStoredUserId, resolveUserId, setStoredUserId } from "./lib/userSession";
+import type { Message, PendingWriteAction, PrivacySettings as Settings, ServiceCard, ServiceContext, UserListItem, WorkflowDiagnosis, WorkflowSolution } from "./types";
 
 type SheetPage = "order" | "orders" | "fulfillment" | "settings" | "actions" | null;
 
@@ -21,7 +25,7 @@ const DEFAULT_SETTINGS: Settings = {
   stream_response: true,
 };
 
-const QUICK_PROMPTS = ["查看券码", "到店核销失败，扫不出来", "联系商家", "我要退款"];
+const QUICK_PROMPTS = ["查看券码", "核销遇到问题", "联系商家", "我要退款"];
 
 const SHEET_TITLES: Record<Exclude<SheetPage, null>, string> = {
   order: "订单详情",
@@ -30,16 +34,6 @@ const SHEET_TITLES: Record<Exclude<SheetPage, null>, string> = {
   settings: "授权设置",
   actions: "操作记录",
 };
-
-const journeyDetail = [
-  ["发现团购", "川巷子火锅双人餐"],
-  ["购买订单", "已支付 ¥168"],
-  ["预约", "建议提前 2 小时"],
-  ["到店", "望京店营业中"],
-  ["核销", "当前异常待处理"],
-  ["消费", "解决后完成"],
-  ["售后", "退款/投诉/人工"],
-];
 
 function uid() {
   return Math.random().toString(36).slice(2, 10);
@@ -52,29 +46,35 @@ function text(value: unknown, fallback = "-") {
 export default function App() {
   const [sheet, setSheet] = useState<SheetPage>(null);
   const [plusOpen, setPlusOpen] = useState(false);
+  const [userList, setUserList] = useState<UserListItem[]>([]);
+  const [userTotal, setUserTotal] = useState(0);
+  const [reshufflingUsers, setReshufflingUsers] = useState(false);
+  const [userId, setUserId] = useState(() => getStoredUserId());
+  const [booting, setBooting] = useState(true);
+  const [welcomeLoading, setWelcomeLoading] = useState(false);
   const [settings, setSettings] = useState<Settings>(() => {
     const saved = localStorage.getItem("douyin-life-settings");
     return saved ? JSON.parse(saved) : DEFAULT_SETTINGS;
   });
-  const edge = useMemo(() => buildEdgeContext(settings), [settings]);
   const [context, setContext] = useState<ServiceContext | null>(null);
+  const [focusOrderId, setFocusOrderId] = useState<string | null>(() => getStoredFocusOrderId(getStoredUserId()));
+  const edge = useMemo(
+    () => buildEdgeContext(settings, userId, context, focusOrderId),
+    [settings, userId, context, focusOrderId],
+  );
   const [sessionId, setSessionId] = useState<string | null>(null);
-  const [messages, setMessages] = useState<Message[]>([
-    {
-      id: uid(),
-      role: "assistant",
-      content: "我会陪你完成这次火锅套餐履约。到店后如果核销有问题，直接跟我说就行。",
-    },
-  ]);
+  const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
   const [streamPhase, setStreamPhase] = useState<"idle" | "observing" | "replying">("idle");
-  const [pipeline, setPipeline] = useState<PipelineStep[]>([]);
-  const [toolCalls, setToolCalls] = useState<ToolCall[]>([]);
+  const [thinkingLines, setThinkingLines] = useState<string[]>([]);
   const [workflow, setWorkflow] = useState<WorkflowDiagnosis | null>(null);
-  const [operationLogs, setOperationLogs] = useState<Array<Record<string, unknown>>>([]);
+  const [serviceRecords, setServiceRecords] = useState<ServiceRecord[]>([]);
+  const [timelineStages, setTimelineStages] = useState<TimelineStage[]>([]);
+  const [sheetLoading, setSheetLoading] = useState(false);
   const [serviceCards, setServiceCards] = useState<ServiceCard[]>([]);
   const [refundOrderId, setRefundOrderId] = useState<string | null>(null);
+  const [writeConfirm, setWriteConfirm] = useState<PendingWriteAction | null>(null);
   const [verificationCodeVersion, setVerificationCodeVersion] = useState(1);
   const [error, setError] = useState<string | null>(null);
   const [llmMode, setLlmMode] = useState("—");
@@ -84,19 +84,168 @@ export default function App() {
   }, [settings]);
 
   useEffect(() => {
-    fetchHealth().then((h) => setLlmMode(h.llm_mode)).catch(() => setLlmMode("offline"));
-    fetchServiceContext().then(setContext).catch(() => setError("服务上下文读取失败"));
-    createSession(edge).then((s) => setSessionId(s.session_id)).catch(() => setError("会话创建失败"));
+    if (!context) return;
+    const orderIds = context.orders.map((order) => String(order.id));
+    const resolved = resolveFocusOrderId(getStoredFocusOrderId(userId), orderIds);
+    setFocusOrderId(resolved);
+    if (resolved !== getStoredFocusOrderId(userId)) setStoredFocusOrderId(resolved, userId);
+  }, [context, userId]);
+
+  const handleFocusOrder = useCallback(
+    (orderId: string) => {
+      setStoredFocusOrderId(orderId, userId);
+      setFocusOrderId(orderId);
+    },
+    [userId],
+  );
+
+  const syncFocusFromServer = useCallback(
+    (orderId: string | null | undefined) => {
+      if (!orderId) return;
+      const orderIds = context?.orders.map((o) => String(o.id)) ?? [];
+      if (!orderIds.includes(orderId)) return;
+      setStoredFocusOrderId(orderId, userId);
+      setFocusOrderId(orderId);
+    },
+    [context, userId],
+  );
+
+  const loadUserSample = useCallback(async (includeUserId?: string) => {
+    const sample = await fetchUserSample(SAMPLE_SIZE, includeUserId);
+    setUserTotal(sample.total);
+    setUserList(sample.users);
+    return sample;
   }, []);
+
+  const loadServiceRecords = useCallback(async (uid: string = userId) => {
+    try {
+      const res = await fetchServiceRecords(uid);
+      setServiceRecords(res.records ?? []);
+    } catch {
+      setServiceRecords([]);
+    }
+  }, [userId]);
+
+  const loadTimeline = useCallback(
+    async (orderId?: string | null, uid: string = userId) => {
+      const oid = orderId ?? focusOrderId ?? (context?.orders[0]?.id ? String(context.orders[0].id) : null);
+      if (!oid) {
+        setTimelineStages([]);
+        return;
+      }
+      try {
+        const res = await fetchFulfillmentTimeline(uid, oid);
+        setTimelineStages(res.stages ?? []);
+      } catch {
+        setTimelineStages([]);
+      }
+    },
+    [userId, focusOrderId, context],
+  );
+
+  const bootstrapUser = useCallback(async (nextUserId: string) => {
+    setError(null);
+    setWelcomeLoading(true);
+    const ctx = await fetchServiceContext(nextUserId);
+    setContext(ctx);
+    const welcomeRes = await fetchWelcome(nextUserId);
+    const nextEdge = buildEdgeContext(settings, nextUserId, ctx, getStoredFocusOrderId(nextUserId));
+    const session = await createSession(nextEdge);
+    setSessionId(session.session_id);
+    setMessages([{ id: uid(), role: "assistant", content: welcomeRes.welcome }]);
+    setWorkflow(null);
+    setServiceRecords([]);
+    setTimelineStages([]);
+    setServiceCards([]);
+    setRefundOrderId(null);
+    setVerificationCodeVersion(1);
+    setWelcomeLoading(false);
+    void loadServiceRecords(nextUserId);
+    return ctx;
+  }, [settings, loadServiceRecords]);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function init() {
+      try {
+        fetchHealth().then((h) => setLlmMode(h.llm_mode)).catch(() => setLlmMode("offline"));
+        const stored = getStoredUserId();
+        const sample = await loadUserSample(stored);
+        if (cancelled) return;
+        const resolved = resolveUserId(
+          stored,
+          sample.users.map((item) => item.id)
+        );
+        if (resolved !== stored) {
+          await loadUserSample(resolved);
+        }
+        setUserId(resolved);
+        setStoredUserId(resolved);
+        await bootstrapUser(resolved);
+      } catch {
+        if (!cancelled) setError("初始化失败，请检查后端服务");
+      } finally {
+        if (!cancelled) setBooting(false);
+      }
+    }
+    void init();
+    return () => {
+      cancelled = true;
+    };
+    // 仅首次挂载拉取用户列表
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const reshuffleUsers = useCallback(async () => {
+    if (reshufflingUsers || streaming || welcomeLoading) return;
+    setReshufflingUsers(true);
+    try {
+      await loadUserSample(userId);
+    } catch {
+      setError("换一批用户失败");
+    } finally {
+      setReshufflingUsers(false);
+    }
+  }, [loadUserSample, reshufflingUsers, streaming, userId, welcomeLoading]);
 
   const refreshContext = useCallback(() => {
-    fetchServiceContext().then(setContext).catch(() => setError("刷新上下文失败"));
-  }, []);
+    fetchServiceContext(userId).then(setContext).catch(() => setError("刷新上下文失败"));
+  }, [userId]);
 
-  const openSheet = useCallback((page: SheetPage) => {
+  const switchUser = useCallback(async (nextUserId: string) => {
+    if (nextUserId === userId || streaming || welcomeLoading) return;
+    setStoredUserId(nextUserId);
+    setUserId(nextUserId);
+    setSheet(null);
     setPlusOpen(false);
-    setSheet(page);
-  }, []);
+    try {
+      await bootstrapUser(nextUserId);
+    } catch {
+      setError("切换用户失败");
+    }
+  }, [bootstrapUser, streaming, userId, welcomeLoading]);
+
+  const openSheet = useCallback(
+    (page: SheetPage) => {
+      setPlusOpen(false);
+      setSheet(page);
+      if (page === "actions") {
+        setSheetLoading(true);
+        void loadServiceRecords().finally(() => setSheetLoading(false));
+      }
+      if (page === "fulfillment") {
+        setSheetLoading(true);
+        void loadTimeline().finally(() => setSheetLoading(false));
+      }
+    },
+    [loadServiceRecords, loadTimeline],
+  );
+
+  useEffect(() => {
+    if (sheet !== "fulfillment") return;
+    setSheetLoading(true);
+    void loadTimeline().finally(() => setSheetLoading(false));
+  }, [focusOrderId, sheet, loadTimeline]);
 
   const send = useCallback(
     async (raw: string) => {
@@ -116,7 +265,7 @@ export default function App() {
       setMessages((items) => [...items, { id: uid(), role: "user", content }]);
       setStreaming(true);
       setStreamPhase("observing");
-      setPipeline([]);
+      setThinkingLines([]);
       setWorkflow(null);
 
       const assistantId = uid();
@@ -125,14 +274,22 @@ export default function App() {
       try {
         await streamChat(sid, content, edge, {
           onPipeline: (payload) => {
-            setStreamPhase("replying");
             const steps = payload.pipeline.steps ?? [];
-            setPipeline(steps);
+            if (steps.some((s) => s.name === "agent_react" || s.name === "agent_decision")) {
+              setStreamPhase("observing");
+            }
             setServiceCards((payload.service_cards ?? []) as ServiceCard[]);
+            syncFocusFromServer(payload.focus_order_id as string | undefined);
             if (payload.case) {
               latestWorkflow = payload.case as WorkflowDiagnosis;
               setWorkflow(latestWorkflow);
             }
+          },
+          onThinking: (payload) => {
+            if (payload.line) {
+              setThinkingLines((prev) => appendThinkingLine(prev, payload.line!));
+            }
+            setStreamPhase("observing");
           },
           onToken: (token) => {
             setStreamPhase("replying");
@@ -143,14 +300,22 @@ export default function App() {
             });
           },
           onDone: (data) => {
-            setPipeline(((data.pipeline as { steps?: PipelineStep[] })?.steps ?? []) as PipelineStep[]);
+            setStreamPhase("idle");
+            setThinkingLines([]);
             setServiceCards((data.service_cards ?? []) as ServiceCard[]);
-            setToolCalls((data.tool_calls ?? []) as ToolCall[]);
+            syncFocusFromServer(data.focus_order_id as string | undefined);
             if (data.workflow || data.case) {
               latestWorkflow = (data.workflow ?? data.case) as WorkflowDiagnosis;
               setWorkflow(latestWorkflow);
+            } else {
+              setWorkflow(null);
             }
-            fetchOperationLogs("user_demo", sid).then((res) => setOperationLogs(res.logs ?? [])).catch(() => undefined);
+            const pending = (data.pending_confirmations ?? []) as PendingWriteAction[];
+            if (pending.length > 0 && !latestWorkflow?.solution?.length) {
+              setWriteConfirm(pending[0]);
+            }
+            void loadServiceRecords();
+            if (sheet === "fulfillment") void loadTimeline();
             setMessages((items) => {
               const rest = items.filter((item) => item.id !== assistantId);
               return [
@@ -162,7 +327,7 @@ export default function App() {
                   intent: text(data.intent, ""),
                   pipeline: data.pipeline as Message["pipeline"],
                   service_cards: (data.service_cards ?? []) as ServiceCard[],
-                  tool_calls: (data.tool_calls ?? []) as ToolCall[],
+                  tool_calls: (data.tool_calls ?? []) as Message["tool_calls"],
                 },
               ];
             });
@@ -176,77 +341,140 @@ export default function App() {
         setStreamPhase("idle");
       }
     },
-    [edge, sessionId, streaming]
+    [edge, sessionId, streaming, userId, syncFocusFromServer, loadServiceRecords, loadTimeline, sheet],
   );
 
-  const hotpotOrder = context?.orders.find((order) => text(order.id) === "order_hotpot_8821") ?? context?.orders[0];
-  const hotpotVoucher = context?.vouchers.find((voucher) => text(voucher.id) === "voucher_hotpot_8821") ?? context?.vouchers[0];
+  const primaryOrder = useMemo(() => {
+    if (!context?.orders.length) return undefined;
+    if (focusOrderId) {
+      return context.orders.find((order) => String(order.id) === focusOrderId);
+    }
+    if (context.orders.length === 1) return context.orders[0];
+    return undefined;
+  }, [context, focusOrderId]);
+  const primaryVoucher =
+    context?.vouchers.find((voucher) => voucher.order_id === primaryOrder?.id) ?? context?.vouchers[0];
+  const primaryStore = useMemo(() => {
+    const storeId = primaryOrder?.store_id ?? primaryVoucher?.store_id;
+    return context?.stores.find((store) => store.id === storeId) ?? context?.stores[0];
+  }, [context, primaryOrder, primaryVoucher]);
 
   const submitRefund = async () => {
     if (!refundOrderId || !sessionId) return;
-    const result = await createRefund(sessionId, refundOrderId, "用户在履约服务管家中发起退款");
+    const orderId = refundOrderId;
+    const result = await createRefund(sessionId, orderId, "用户在履约服务管家中发起退款", userId);
     setRefundOrderId(null);
     setMessages((items) => [
       ...items,
       { id: uid(), role: "assistant", content: `退款申请已提交，售后单 ${result.id}，我会继续跟进处理进度。` },
     ]);
     refreshContext();
+    void loadServiceRecords();
+    void loadTimeline(orderId);
   };
 
-  const runWorkflowAction = async (actionId: string, title: string) => {
+  const confirmWriteAction = async () => {
+    if (!writeConfirm || !sessionId) return;
+    const item = writeConfirm;
+    setWriteConfirm(null);
+    if (item.action_id === "apply_refund" && item.order_id) {
+      const result = await createRefund(sessionId, item.order_id, String(item.payload?.reason ?? "用户确认退款"), userId);
+      setMessages((items) => [
+        ...items,
+        { id: uid(), role: "assistant", content: `好的，退款申请已提交，售后单 ${result.id}。` },
+      ]);
+    } else {
+      await runWorkflowAction(
+        item.action_id,
+        item.title,
+        item.order_id ?? undefined,
+        item.voucher_id ?? undefined,
+      );
+    }
+    refreshContext();
+    void loadServiceRecords();
+    void loadTimeline();
+  };
+
+  const runWorkflowAction = async (
+    actionId: string,
+    title: string,
+    orderIdOverride?: string,
+    voucherIdOverride?: string,
+  ) => {
     if (!sessionId) return;
+    const orderId = orderIdOverride ?? (primaryOrder?.id ? String(primaryOrder.id) : undefined);
+    const voucherId = voucherIdOverride ?? (primaryVoucher?.id ? String(primaryVoucher.id) : undefined);
     try {
       const result = await executeWorkflowAction(
         sessionId,
         actionId,
-        hotpotOrder?.id ? String(hotpotOrder.id) : undefined,
-        hotpotVoucher?.id ? String(hotpotVoucher.id) : undefined
+        orderId,
+        voucherId,
+        undefined,
+        userId
       );
       if (actionId === "regenerate_qr") setVerificationCodeVersion((value) => value + 1);
       setMessages((items) => [
         ...items,
         { id: uid(), role: "assistant", content: formatActionResult(actionId, title, result) },
       ]);
-      fetchOperationLogs("user_demo", sessionId).then((res) => setOperationLogs(res.logs ?? [])).catch(() => undefined);
       refreshContext();
+      void loadServiceRecords();
+      void loadTimeline();
     } catch {
       setError(`执行「${title}」失败，请稍后重试`);
     }
   };
 
-  const thinkingLines = buildThinkingLines(pipeline, workflow, streaming);
-  const thinkingSummary = streaming ? null : summarizeWorkflow(workflow);
+  const thinkingNarrative = formatThinkingDisplay(thinkingLines, streaming && streamPhase === "observing");
+  const showThinking = streaming && streamPhase === "observing";
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-[#0f0f10] px-3 py-4 text-slate-950">
+    <div className="min-h-screen flex items-center justify-center bg-slate-200 px-3 py-4 text-slate-950">
       <PhoneShell>
-        <header className="shrink-0 bg-[#111] px-4 pb-2.5 pt-1 text-white">
+        <header className="shrink-0 border-b border-slate-100 bg-white px-4 pb-3 pt-1">
           <div className="flex items-center justify-between">
             <div>
-              <div className="text-[10px] text-white/45">抖音生活服务</div>
-              <div className="text-base font-bold">AI履约服务管家</div>
+              <div className="text-[10px] font-medium text-[#fe2c55]">抖音生活服务</div>
+              <div className="text-base font-bold text-slate-900">AI 履约服务管家</div>
             </div>
             <div className="text-right">
-              <div className="text-[10px] text-white/40">在线 · {llmMode}</div>
-              <button type="button" onClick={() => openSheet("settings")} className="mt-1 text-[11px] text-white/70">
+              <div className="text-[10px] text-slate-400">在线 · {llmMode}</div>
+              <button
+                type="button"
+                onClick={() => openSheet("settings")}
+                className="mt-1 text-[11px] font-medium text-slate-600 hover:text-[#fe2c55]"
+              >
                 设置
               </button>
             </div>
           </div>
+          <DemoUserSwitcher
+            users={userList}
+            totalUsers={userTotal}
+            value={userId}
+            onChange={switchUser}
+            onReshuffle={reshuffleUsers}
+            disabled={streaming || booting || welcomeLoading}
+            reshuffling={reshufflingUsers}
+          />
         </header>
 
+        {booting || welcomeLoading ? (
+          <div className="flex flex-1 items-center justify-center bg-[#f5f5f5] px-4 text-sm text-slate-500">
+            {booting ? "正在加载用户列表…" : "正在生成欢迎语…"}
+          </div>
+        ) : (
         <ConversationView
           context={context}
-          order={hotpotOrder}
-          voucher={hotpotVoucher}
           messages={messages}
           streaming={streaming}
-          streamPhase={streamPhase}
           input={input}
           error={error}
           workflow={workflow}
-          thinkingLines={thinkingLines}
-          thinkingSummary={thinkingSummary}
+          thinkingNarrative={thinkingNarrative}
+          showThinking={showThinking}
           plusOpen={plusOpen}
           verificationCodeVersion={verificationCodeVersion}
           onInput={setInput}
@@ -256,24 +484,28 @@ export default function App() {
           onClosePlus={() => setPlusOpen(false)}
           onRefund={setRefundOrderId}
           onWorkflowAction={runWorkflowAction}
+          focusOrderId={focusOrderId}
+          onFocusOrder={handleFocusOrder}
         />
+        )}
 
         <BottomSheet title={sheet ? SHEET_TITLES[sheet] : ""} open={sheet !== null} onClose={() => setSheet(null)}>
           <DetailContent
             page={sheet ?? "order"}
             context={context}
-            order={hotpotOrder}
-            voucher={hotpotVoucher}
+            order={primaryOrder}
+            voucher={primaryVoucher}
+            store={primaryStore}
             settings={settings}
-            pipeline={pipeline}
-            toolCalls={toolCalls}
-            operationLogs={operationLogs}
+            serviceRecords={serviceRecords}
+            timelineStages={timelineStages}
+            sheetLoading={sheetLoading}
             onToggle={(key) => setSettings((current) => ({ ...current, [key]: !current[key] }))}
             onSend={send}
             onRefund={setRefundOrderId}
             onWorkflowAction={runWorkflowAction}
             onSelectOrder={(orderId) => {
-              void orderId;
+              handleFocusOrder(orderId);
               setSheet("order");
             }}
           />
@@ -288,6 +520,16 @@ export default function App() {
             onClose={() => setRefundOrderId(null)}
           />
         )}
+
+        {writeConfirm && (
+          <ActionSheet
+            title={`确认${writeConfirm.title}`}
+            description={writeConfirm.description || "此操作将修改您的订单或发起服务请求，请确认。"}
+            primaryText="确认执行"
+            onPrimary={() => void confirmWriteAction()}
+            onClose={() => setWriteConfirm(null)}
+          />
+        )}
       </PhoneShell>
     </div>
   );
@@ -295,16 +537,13 @@ export default function App() {
 
 function ConversationView({
   context,
-  order,
-  voucher,
   messages,
   streaming,
-  streamPhase,
   input,
   error,
   workflow,
-  thinkingLines,
-  thinkingSummary,
+  thinkingNarrative,
+  showThinking,
   plusOpen,
   verificationCodeVersion,
   onInput,
@@ -314,18 +553,17 @@ function ConversationView({
   onClosePlus,
   onRefund,
   onWorkflowAction,
+  focusOrderId,
+  onFocusOrder,
 }: {
   context: ServiceContext | null;
-  order?: Record<string, unknown>;
-  voucher?: Record<string, unknown>;
   messages: Message[];
   streaming: boolean;
-  streamPhase: "idle" | "observing" | "replying";
   input: string;
   error: string | null;
   workflow: WorkflowDiagnosis | null;
-  thinkingLines: ReturnType<typeof buildThinkingLines>;
-  thinkingSummary: string | null;
+  thinkingNarrative: string;
+  showThinking: boolean;
   plusOpen: boolean;
   verificationCodeVersion: number;
   onInput: (value: string) => void;
@@ -335,6 +573,8 @@ function ConversationView({
   onClosePlus: () => void;
   onRefund: (orderId: string) => void;
   onWorkflowAction: (actionId: string, title: string) => void;
+  focusOrderId: string | null;
+  onFocusOrder: (orderId: string) => void;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const solutions = workflow?.solution ?? [];
@@ -346,21 +586,19 @@ function ConversationView({
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
-  }, [messages, streaming, thinkingLines.length, workflow]);
+  }, [messages, streaming, thinkingNarrative, workflow]);
 
   return (
     <>
       <main ref={scrollRef} className="flex-1 overflow-y-auto bg-[#f5f5f5] px-3 py-3">
         <div className="flex min-h-full flex-col gap-2.5">
-          <FulfillmentContextCard
-            orderTitle={text(order?.title, undefined)}
-            userName={text(context?.user.display_name, undefined)}
-            city={text(context?.user.city, undefined)}
-            paidAmount={text(order?.paid_amount, "168")}
-            voucherCode={text(voucher?.code, undefined)}
-            statusLabel={text(voucher?.status, "待核销") === "unused" ? "待核销" : text(voucher?.status, "待核销")}
+          <OrderFocusPanel
+            orders={context?.orders ?? []}
+            vouchers={context?.vouchers ?? []}
+            focusOrderId={focusOrderId}
+            onFocusOrder={onFocusOrder}
+            onOpenOrders={() => onOpenSheet("orders")}
             onOpenProgress={() => onOpenSheet("fulfillment")}
-            onOpenOrder={() => onOpenSheet("order")}
           />
 
           {settledMessages.map((message) => (
@@ -375,9 +613,7 @@ function ConversationView({
             </div>
           ))}
 
-          {streaming && (
-            <ThinkingProcess lines={thinkingLines} active summary={null} />
-          )}
+          {showThinking && <ThinkingStream text={thinkingNarrative} active />}
 
           {streamingAssistant && (
             <div className="flex justify-start">
@@ -385,10 +621,6 @@ function ConversationView({
                 {streamingAssistant.content || "…"}
               </div>
             </div>
-          )}
-
-          {!streaming && thinkingLines.length > 0 && (
-            <ThinkingProcess lines={thinkingLines} active={false} summary={thinkingSummary} />
           )}
 
           {!streaming && solutions.length > 0 && (
@@ -486,10 +718,11 @@ function DetailContent({
   context,
   order,
   voucher,
+  store,
   settings,
-  pipeline,
-  toolCalls,
-  operationLogs,
+  serviceRecords,
+  timelineStages,
+  sheetLoading,
   onToggle,
   onSend,
   onRefund,
@@ -500,10 +733,11 @@ function DetailContent({
   context: ServiceContext | null;
   order?: Record<string, unknown>;
   voucher?: Record<string, unknown>;
+  store?: Record<string, unknown>;
   settings: Settings;
-  pipeline: PipelineStep[];
-  toolCalls: ToolCall[];
-  operationLogs: Array<Record<string, unknown>>;
+  serviceRecords: ServiceRecord[];
+  timelineStages: TimelineStage[];
+  sheetLoading: boolean;
   onToggle: (key: keyof Settings) => void;
   onSend: (value: string) => void;
   onRefund: (orderId: string) => void;
@@ -568,178 +802,20 @@ function DetailContent({
       )}
 
       {page === "fulfillment" && (
-        <div className="space-y-3">
-          {journeyDetail.map(([name, desc], index) => (
-            <div key={name} className="rounded-2xl bg-white p-3">
-              <div className="flex items-center gap-3">
-                <span
-                  className={`flex h-7 w-7 items-center justify-center rounded-full text-xs font-bold ${
-                    index <= 4 ? "bg-[#fe2c55] text-white" : "bg-slate-100"
-                  }`}
-                >
-                  {index + 1}
-                </span>
-                <div>
-                  <div className="text-sm font-bold">{name}</div>
-                  <div className="text-xs text-slate-500">{desc}</div>
-                </div>
-              </div>
-            </div>
-          ))}
-          <button
-            type="button"
-            onClick={() => onSend("到店核销失败，扫不出来")}
-            className="w-full rounded-2xl bg-[#111] py-3 text-sm font-semibold text-white"
-          >
-            让 AI 帮我处理核销问题
-          </button>
-          <button
-            type="button"
-            onClick={() => onWorkflowAction("regenerate_qr", "重新生成核销码")}
-            className="w-full rounded-2xl bg-[#fe2c55] py-3 text-sm font-semibold text-white"
-          >
-            重新生成核销码
-          </button>
-        </div>
+        <ServiceProgressPanel
+          stages={timelineStages}
+          loading={sheetLoading}
+          orderTitle={order?.title ? String(order.title) : undefined}
+          onAskAi={() => onSend("核销遇到问题，帮我处理一下")}
+          onRegenerateQr={() => onWorkflowAction("regenerate_qr", "重新生成核销码")}
+        />
       )}
 
       {page === "actions" && (
-        <>
-          <OperationRecords pipeline={pipeline} toolCalls={toolCalls} operationLogs={operationLogs} />
-          <InfoCard
-            title="用户上下文"
-            rows={[
-              ["用户", text(context?.user.display_name)],
-              ["城市", text(context?.user.city)],
-              ["订单数", String(context?.orders.length ?? 0)],
-              ["券包数", String((context?.vouchers.length ?? 0) + (context?.coupons.length ?? 0))],
-            ]}
-          />
-        </>
+        <ServiceRecordsPanel records={serviceRecords} loading={sheetLoading} />
       )}
     </div>
   );
-}
-
-function OperationRecords({
-  pipeline,
-  toolCalls,
-  operationLogs,
-}: {
-  pipeline: PipelineStep[];
-  toolCalls: ToolCall[];
-  operationLogs: Array<Record<string, unknown>>;
-}) {
-  const persisted = operationLogs.map((log) => ({
-    actor: actorLabel(String(log.actor)),
-    title: String(log.summary ?? log.operation_type),
-    detail: humanizeLogDetail(log),
-    tone: String(log.actor ?? "agent"),
-  }));
-  const records = [
-    ...persisted.slice(0, 8),
-    ...pipeline.map((step) => ({
-      actor: "管家",
-      title: stepName(step.name),
-      detail: humanizeStepDetail(step),
-      tone: "agent",
-    })),
-    ...toolCalls.map((call) => ({
-      actor: "系统",
-      title: toolName(call.name),
-      detail: toolSummary(call.result),
-      tone: "tool",
-    })),
-  ];
-
-  return (
-    <div className="rounded-[22px] bg-white p-4 shadow-sm">
-      <div className="flex items-center justify-between">
-        <div>
-          <div className="text-sm font-bold">操作记录</div>
-          <div className="mt-1 text-xs text-slate-500">本次履约服务中的关键动作</div>
-        </div>
-        <span className="rounded-full bg-[#fff1f3] px-2 py-1 text-[10px] font-semibold text-[#fe2c55]">{records.length} 条</span>
-      </div>
-      <div className="mt-4 space-y-3">
-        {records.map((record, index) => (
-          <div key={`${record.actor}-${record.title}-${index}`} className="flex gap-3">
-            <div className={`mt-1 h-2.5 w-2.5 shrink-0 rounded-full ${dotClass(record.tone)}`} />
-            <div className="flex-1 border-b border-slate-100 pb-3 last:border-b-0">
-              <div className="text-[11px] font-semibold text-slate-400">{record.actor}</div>
-              <div className="mt-1 text-sm font-bold">{record.title}</div>
-              <div className="mt-1 text-xs leading-relaxed text-slate-500">{record.detail}</div>
-            </div>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function humanizeLogDetail(log: Record<string, unknown>) {
-  const summary = String(log.summary ?? "");
-  if (summary.includes("Case")) {
-    return summary.replace(/Case\s+[A-Z]+-\d+/g, "问题").slice(0, 80);
-  }
-  return summary.slice(0, 80) || "已记录";
-}
-
-function humanizeStepDetail(step: PipelineStep) {
-  const detail = step.detail ?? "已完成";
-  return detail
-    .replace(/\b(IC|PC|FC|AC|CC)-\d{3}\b/g, "")
-    .replace(/P[0-3]/g, "")
-    .replace(/\s{2,}/g, " ")
-    .trim() || "已完成";
-}
-
-function dotClass(tone: string) {
-  if (tone === "user") return "bg-[#111]";
-  if (tone === "tool") return "bg-[#fe2c55]";
-  return "bg-emerald-500";
-}
-
-function stepName(name: string) {
-  const names: Record<string, string> = {
-    intent_detect: "理解您的需求",
-    workflow_match: "匹配处理方式",
-    service_context: "查看订单与券",
-    knowledge_search: "查阅服务说明",
-    diagnosis_tree: "核对问题原因",
-    case_generate: "整理解决方案",
-    tool_action: "调取业务信息",
-    prompt_build: "组织回复",
-    model_response: "生成回复",
-  };
-  return names[name] ?? name;
-}
-
-function toolName(name: string) {
-  const names: Record<string, string> = {
-    query_order: "查询订单",
-    query_voucher: "查询团购券",
-    query_coupon: "查询优惠券",
-    query_store: "查询门店",
-    query_refund: "查询售后",
-    create_refund_case: "创建退款申请",
-    create_service_ticket: "创建服务工单",
-    transfer_to_human: "转人工",
-    run_diagnosis: "完成问题核对",
-  };
-  return names[name] ?? name;
-}
-
-function toolSummary(result: unknown) {
-  if (!result) return "已完成";
-  if (typeof result === "object" && result !== null && "case_name" in result) {
-    return `确认问题：${String((result as Record<string, unknown>).case_name)}`;
-  }
-  const raw = JSON.stringify(result);
-  if (raw.includes("store_name")) return "已读取门店名称、营业时间和联系方式";
-  if (raw.includes("vouchers")) return "已读取团购券状态和券码";
-  if (raw.includes("order")) return "已读取订单状态与退款能力";
-  return "相关信息已就绪";
 }
 
 function InfoCard({ title, rows }: { title: string; rows: [string, string][] }) {
@@ -756,11 +832,6 @@ function InfoCard({ title, rows }: { title: string; rows: [string, string][] }) 
       </div>
     </div>
   );
-}
-
-function actorLabel(actor: string) {
-  const map: Record<string, string> = { user: "您", agent: "管家", tool: "系统", system: "系统" };
-  return map[actor] ?? actor;
 }
 
 function formatActionResult(actionId: string, title: string, result: Record<string, unknown>) {

@@ -7,7 +7,6 @@ import re
 from dataclasses import dataclass, field
 
 from app.config import settings
-from app.diagnosis.storybook import match_storybook_intents
 from app.services.llm import LLMService
 
 # SDS v1 可进入诊断引擎的意图
@@ -65,6 +64,7 @@ INTENT_CATALOG: dict[str, str] = {
     "HumanTransfer": "转人工、找客服",
     "chitchat": "闲聊寒暄，与履约无关",
     "clarify": "意图模糊，需澄清",
+    "unconfigured": "不在已配置履约意图范围内",
 }
 
 
@@ -77,11 +77,12 @@ class IntentResult:
     source: str
     needs_clarify: bool
     alternatives: list[dict[str, float | str]] = field(default_factory=list)
+    route_category: str = "configured"  # configured | chitchat | unconfigured
 
     def to_pipeline_detail(self) -> str:
         flag = "需澄清" if self.needs_clarify else "已路由"
         return (
-            f"{self.route_intent} ({self.confidence:.0%}, {self.source}, {flag})"
+            f"[{self.route_category}] {self.route_intent} ({self.confidence:.0%}, {self.source}, {flag})"
             f"{f' — {self.reasoning}' if self.reasoning else ''}"
         )
 
@@ -112,10 +113,9 @@ _KEYWORD_RULES: list[tuple[str, tuple[str, ...], float]] = [
 
 def _keyword_classify(message: str) -> IntentResult:
     text = message.strip()
-    sb_hints = match_storybook_intents(text)
-    best_intent = sb_hints[0] if sb_hints else "clarify"
-    best_score = 0.72 if sb_hints else 0.35
-    reasoning = "Storybook 表达匹配" if sb_hints else "未匹配明确履约表达"
+    best_intent = "clarify"
+    best_score = 0.35
+    reasoning = "还需要您说具体一点，我才能确定要帮您办什么"
     alts: list[dict[str, float | str]] = []
 
     for intent, keywords, base in _KEYWORD_RULES:
@@ -127,10 +127,17 @@ def _keyword_classify(message: str) -> IntentResult:
         if score > best_score:
             best_score = score
             best_intent = intent
-            reasoning = f"关键词/Storybook 命中 {intent}"
+            reasoning = "从您的表述里能听出比较明确的问题方向"
 
     alts.sort(key=lambda x: float(x["confidence"]), reverse=True)
     return _apply_threshold(best_intent, best_score, reasoning, "keyword", alts[:3])
+
+
+def _need_hint(code: str) -> str:
+    desc = INTENT_CATALOG.get(code, "")
+    if not desc:
+        return "其他相关问题"
+    return desc.split("（")[0].strip()
 
 
 def _apply_threshold(
@@ -143,15 +150,19 @@ def _apply_threshold(
     threshold = settings.intent_confidence_threshold
 
     if raw_intent == "chitchat" and confidence >= threshold:
-        return IntentResult(raw_intent, "chitchat", confidence, reasoning, source, False, alternatives)
+        return IntentResult(raw_intent, "chitchat", confidence, reasoning, source, False, alternatives, "chitchat")
+
+    if raw_intent == "unconfigured":
+        return IntentResult(raw_intent, "unconfigured", confidence, reasoning, source, True, alternatives, "unconfigured")
 
     if raw_intent in ACTIONABLE_INTENTS and confidence >= threshold:
-        return IntentResult(raw_intent, raw_intent, confidence, reasoning, source, False, alternatives)
+        return IntentResult(raw_intent, raw_intent, confidence, reasoning, source, False, alternatives, "configured")
 
     alt_hint = ""
     if alternatives:
         top = alternatives[0]
-        alt_hint = f"；最可能 {top['intent']}({float(top['confidence']):.0%})"
+        top_code = str(top.get("intent") or "")
+        alt_hint = f"；也可能是{_need_hint(top_code)}"
     return IntentResult(
         raw_intent,
         "clarify",
@@ -160,6 +171,7 @@ def _apply_threshold(
         source,
         True,
         alternatives,
+        "configured",
     )
 
 
@@ -186,30 +198,38 @@ class IntentClassifier:
         self.llm = llm or LLMService()
 
     async def classify(self, message: str, history: list[dict] | None = None) -> IntentResult:
+        """关键词优先：高置信度直接路由，仅模糊表达才调用轻量 LLM。"""
+        kw = _keyword_classify(message)
+        threshold = settings.intent_confidence_threshold
+        if kw.route_intent != "clarify" and kw.confidence >= threshold:
+            return kw
         if settings.intent_use_llm and not self.llm.use_mock:
-            result = await self._classify_with_llm(message, history or [])
-            if result:
-                return result
-        return _keyword_classify(message)
+            llm_result = await self._classify_with_llm(message, history or [])
+            if llm_result:
+                return llm_result
+        return kw
 
     async def _classify_with_llm(self, message: str, history: list[dict]) -> IntentResult | None:
-        catalog = "\n".join(f"- {k}: {v}" for k, v in INTENT_CATALOG.items())
         recent = "\n".join(f"{m['role']}: {m['content'][:120]}" for m in history[-4:]) or "无"
 
         system = f"""你是抖音生活服务 SDS v1 意图分类器。理解口语、省略、口水话，输出 JSON。
 
-Intent 列表（只能从中选择）：
-{catalog}
+已配置 Intent 列表（route_category=configured 时从中选择 intent）：
+{chr(10).join(f"- {k}: {v}" for k, v in INTENT_CATALOG.items() if k not in ("chitchat", "clarify", "unconfigured"))}
+
+route_category 三类（必填）：
+- configured：能映射到上述某一 Intent
+- chitchat：寒暄、与履约无关
+- unconfigured：明确是履约/生活诉求，但不在已配置 Intent 中
 
 规则：
-1. 「到了刷不出来」「老板不给用」→ VoucherUnavailable（不是 QueryVoucher）
-2. 「付了钱没券」→ QueryOrder 或 VoucherUnavailable
-3. 食品安全/人身安全 → SafetyComplaint，confidence 应高
-4. 明显闲聊 → chitchat；无法判断 → clarify 且 confidence 偏低
-5. confidence 0~1；alternatives 给 1-2 个次选
+1. 「到了刷不出来」「老板不给用」→ configured + VoucherUnavailable
+2. 明显闲聊 → chitchat
+3. 无法判断具体 Intent 但仍属履约 → configured + clarify 且 confidence 偏低
+4. confidence 0~1；alternatives 给 1-2 个次选
 
 只输出 JSON：
-{{"intent":"...", "confidence":0.0, "reasoning":"...", "alternatives":[{{"intent":"...", "confidence":0.0}}]}}"""
+{{"route_category":"configured|chitchat|unconfigured", "intent":"...", "confidence":0.0, "reasoning":"...", "alternatives":[{{"intent":"...", "confidence":0.0}}]}}"""
 
         raw = await self.llm.complete(system, f"最近对话：\n{recent}\n\n用户最新：{message}", temperature=settings.intent_llm_temperature, max_tokens=settings.intent_llm_max_tokens)
         if not raw:
@@ -219,7 +239,15 @@ Intent 列表（只能从中选择）：
             return None
 
         raw_intent = str(data.get("intent") or "clarify").strip()
-        if raw_intent not in INTENT_CATALOG:
+        route_category = str(data.get("route_category") or "configured").strip()
+        if route_category not in ("configured", "chitchat", "unconfigured"):
+            route_category = "configured"
+
+        if route_category == "chitchat":
+            raw_intent = "chitchat"
+        elif route_category == "unconfigured":
+            raw_intent = "unconfigured"
+        elif raw_intent not in INTENT_CATALOG or raw_intent in ("chitchat", "unconfigured"):
             raw_intent = "clarify"
         try:
             confidence = max(0.0, min(1.0, float(data.get("confidence", 0))))
@@ -239,4 +267,13 @@ Intent 列表（只能从中选择）：
             except (TypeError, ValueError):
                 pass
 
-        return _apply_threshold(raw_intent, confidence, reasoning, "llm", alternatives)
+        result = _apply_threshold(raw_intent, confidence, reasoning, "llm", alternatives)
+        if route_category == "unconfigured":
+            result.route_category = "unconfigured"
+            result.route_intent = "unconfigured"
+            result.needs_clarify = True
+        elif route_category == "chitchat":
+            result.route_category = "chitchat"
+        else:
+            result.route_category = "configured"
+        return result

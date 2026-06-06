@@ -3,6 +3,9 @@
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.db.bulk_bootstrap import ensure_bulk_seed
+from app.db.knowledge_bootstrap import ensure_knowledge_seed
+
 MIGRATIONS = [
     """
     ALTER TABLE merchant_stores
@@ -46,8 +49,32 @@ MIGRATIONS = [
     """,
 ]
 
+# 移除 Storybook 个案知识（id 6–10 为历史预埋，已废弃）
+STORY_DATA_CLEANUP = [
+    "DELETE FROM agent_operation_logs WHERE user_id IN ('user_demo','user_story_a','user_story_b');",
+    "DELETE FROM service_tickets WHERE user_id IN ('user_demo','user_story_a','user_story_b');",
+    "DELETE FROM fulfillment_events WHERE user_id IN ('user_demo','user_story_a','user_story_b');",
+    "DELETE FROM refund_cases WHERE user_id IN ('user_demo','user_story_a','user_story_b');",
+    "DELETE FROM vouchers WHERE user_id IN ('user_demo','user_story_a','user_story_b');",
+    "DELETE FROM coupons WHERE user_id IN ('user_demo','user_story_a','user_story_b');",
+    "DELETE FROM life_orders WHERE user_id IN ('user_demo','user_story_a','user_story_b');",
+    "DELETE FROM knowledge_articles WHERE id BETWEEN 6 AND 10 OR id IN (20, 21, 22);",
+    "DELETE FROM users WHERE id IN ('user_demo','user_story_a','user_story_b');",
+    """
+    DELETE FROM merchant_stores WHERE id IN (
+      'store_hotpot_001','store_cinema_001','store_massage_001',
+      'store_closed_001','store_reject_001','store_reloc_001','store_nophone_001',
+      'store_busy_001'
+    );
+    """,
+]
+
 
 async def apply_migrations(db: AsyncSession) -> None:
     for sql in MIGRATIONS:
         await db.execute(text(sql))
+    for sql in STORY_DATA_CLEANUP:
+        await db.execute(text(sql))
+    await ensure_knowledge_seed(db)
+    await ensure_bulk_seed(db)
     await db.commit()

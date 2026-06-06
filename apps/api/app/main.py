@@ -21,6 +21,7 @@ async def lifespan(app: FastAPI):
     async with SessionLocal() as db:
         await apply_migrations(db)
     yield
+    await llm.aclose()
 
 
 app = FastAPI(

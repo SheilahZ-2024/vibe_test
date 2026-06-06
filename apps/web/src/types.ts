@@ -1,5 +1,17 @@
+export interface UserListItem {
+  id: string;
+  display_name: string;
+  city: string;
+  membership_level: string;
+  phone_mask?: string | null;
+  order_count: number;
+  voucher_count: number;
+  highlight_order?: string | null;
+}
+
 export interface EdgeContext {
   user_id: string;
+  focus_order_id?: string | null;
   city: string;
   recent_order_ids: string[];
   local_voucher_summary: string[];
@@ -62,8 +74,18 @@ export interface ToolCall {
 export interface WorkflowSolution {
   action_id: string;
   title: string;
-  description: string;
+  description?: string;
+  tool?: string;
+}
+
+export interface PendingWriteAction {
   tool: string;
+  action_id: string;
+  title: string;
+  description: string;
+  order_id?: string | null;
+  voucher_id?: string | null;
+  payload?: Record<string, unknown>;
 }
 
 export interface WorkflowDiagnosis {

@@ -6,7 +6,7 @@
 
 ## 核心能力
 
-- 展示履约旅程：发现团购、购买、预约、到店、核销、消费、售后。
+- 展示履约旅程：发现团购、购买、预约、到店、核销、售后。
 - 查询生活服务订单：团购套餐、电影票、预约服务。
 - 查看团购券：券码、有效期、核销状态、使用规则。
 - 诊断核销失败：查询订单、团购券、门店，给出可执行解决方案。
@@ -36,7 +36,12 @@ Intent识别 → 上下文获取 → 诊断树执行 → Case生成 → 工具�
 - **Case 体系**：73 个注册 Case（IC 10 + PC 15 + FC 20 + AC 10 + CC 15 + 系统 3）
 - **代码入口**：`apps/api/app/diagnosis/`（`case_specs` / `registry` / `engine` / `matrices` / `storybook`）
 - **Storybook**：SB-001 ~ SB-018 口语表达库，见 `storybook.py`
-- **种子数据**：`deploy/init-db/04-sds-storybook-seed.sql`、`05-sds-full-seed.sql`
+- **种子数据**（`deploy/init-db/`，按文件名顺序执行）：
+  - `01-schema.sql` — 建表
+  - `02-knowledge-seed.sql` — **平台知识库唯一来源**（18 条 policy/refund/coupon 等）
+  - `03-bulk-seed.sql` — 120 用户 mock 业务数据（由 `scripts/generate_mock_data.py` 生成；**只写业务事实，不预写诊断结论**）
+  - `04`/`05` — 已废弃占位（Storybook 个案不再灌库）
+  - `02-seed.sql`、`06-knowledge-refine.sql` — 已合并至 `02-knowledge-seed.sql`
 
 ### 前端体验（会话为主）
 
@@ -151,7 +156,9 @@ cd C:\Users\15924\Projects\smart-assistant\apps\api
 | GET | `/health` | 健康检查 |
 | GET | `/health/llm/ping` | 模型连通性测试 |
 | GET | `/api/v1/users/{user_id}/fulfillment-events` | 履约事件列表 |
-| GET | `/api/v1/users/{user_id}/operation-logs` | 操作记录列表 |
+| GET | `/api/v1/users/{user_id}/orders/{order_id}/fulfillment-timeline` | 订单履约时间线（购买→预约→到店→核销→售后） |
+| GET | `/api/v1/users/{user_id}/service-records` | 操作记录（含退款金额与到账状态） |
+| GET | `/api/v1/users/{user_id}/operation-logs` | 助手操作日志（会话产生，seed 不预填） |
 | GET | `/api/v1/diagnosis/cases` | Case 列表 |
 | GET | `/api/v1/diagnosis/cases/{case_id}` | Case 详情与推荐动作 |
 | GET | `/api/v1/diagnosis/stats` | Case 统计 |

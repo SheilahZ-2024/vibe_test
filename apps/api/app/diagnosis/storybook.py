@@ -131,7 +131,19 @@ MESSAGE_CASE_HINTS: list[tuple[tuple[str, ...], str, str]] = [
 ]
 
 
+def oral_expression_guidance() -> str:
+    """从 Storybook 提炼的口语理解规则"""
+    return """── 口语表达理解（辅助意图，Case 须由你结合数据与诊断规则自行判定）──
+- 「扫不出来/刷不出来/核销失败」→ 多为 VoucherUnavailable，但须 query 券/门店/预约后确认
+- 「老板不给用/说不认」→ 区分 MerchantReject 与系统核销失败，以真实 metadata 为准
+- 「付了钱没券/券丢了/过期了」→ QueryOrder / QueryVoucher，按数据定位
+- 「门店关门/打不通/搬走了」→ StoreUnavailable
+- 「缩水/缺货/加价/吃坏了」→ ServiceMismatch / PriceDispute / SafetyComplaint
+- 口语仅辅助理解，禁止按关键词直接假定 Case 或跳过澄清"""
+
+
 def storybook_prompt_block() -> str:
+    """完整 SB 列表，仅供批测/文档，不注入 Agent Prompt。"""
     lines = ["Storybook 口语映射（SB-001~018）："]
     for sb_id, data in STORYBOOK.items():
         expr = " / ".join(data["expressions"][:3])

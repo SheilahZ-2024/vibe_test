@@ -1,15 +1,31 @@
-import type { EdgeContext, PipelineStep, PrivacySettings, ServiceContext } from "../types";
+import type { EdgeContext, PipelineStep, PrivacySettings, ServiceContext, UserListItem } from "../types";
+import { getStoredUserId } from "../lib/userSession";
+import { getStoredFocusOrderId } from "../lib/orderFocus";
 
 // 生产环境走同源 /api 代理；本地 dev 由 Vite proxy 转发
 const API = import.meta.env.VITE_API_BASE_URL ?? "";
 
-export function buildEdgeContext(settings: PrivacySettings): EdgeContext {
-  const recentOrderIds = settings.order_access ? ["order_hotpot_8821", "order_movie_7718"] : [];
-  const voucherSummary = settings.voucher_access ? ["川巷子火锅双人餐券未使用", "电影票今晚 20:10"] : [];
+export function buildEdgeContext(
+  settings: PrivacySettings,
+  userId?: string,
+  ctx?: ServiceContext | null,
+  focusOrderId?: string | null,
+): EdgeContext {
+  const uid = userId ?? getStoredUserId();
+  const city = settings.location_access ? String(ctx?.user.city ?? "北京") : "未知";
+  const recentOrderIds = settings.order_access
+    ? (ctx?.orders ?? []).slice(0, 3).map((order) => String(order.id))
+    : [];
+  const voucherSummary = settings.voucher_access
+    ? (ctx?.vouchers ?? []).slice(0, 3).map((voucher) => `${voucher.title} · ${voucher.status}`)
+    : [];
   const behaviorTags = settings.behavior_summary ? ["近期频繁查看团购券", "关注退款进度"] : [];
+  const focus =
+    focusOrderId !== undefined ? focusOrderId : getStoredFocusOrderId(uid);
   const payload = {
-    user_id: "user_demo",
-    city: settings.location_access ? "北京" : "未知",
+    user_id: uid,
+    focus_order_id: focus,
+    city,
     recent_order_ids: recentOrderIds,
     local_voucher_summary: voucherSummary,
     behavior_tags: behaviorTags,
@@ -29,8 +45,60 @@ export async function createSession(edge: EdgeContext): Promise<{ session_id: st
   return res.json();
 }
 
-export async function fetchServiceContext(userId = "user_demo"): Promise<ServiceContext> {
-  const res = await fetch(`${API}/api/v1/users/${userId}/service-context`);
+/** 从 DB 全量用户中随机抽取样本（默认 10 人） */
+export async function fetchUserSample(count = 10, includeUserId?: string): Promise<{
+  total: number;
+  sample_size: number;
+  users: UserListItem[];
+}> {
+  const params = new URLSearchParams({ count: String(count) });
+  if (includeUserId) params.set("include_user_id", includeUserId);
+  const res = await fetch(`${API}/api/v1/users/sample?${params}`);
+  if (!res.ok) throw new Error("读取用户样本失败");
+  return res.json();
+}
+
+export async function fetchUsers(limit = 500, offset = 0): Promise<UserListItem[]> {
+  const res = await fetch(`${API}/api/v1/users?limit=${limit}&offset=${offset}`);
+  if (!res.ok) throw new Error("读取用户列表失败");
+  return res.json();
+}
+
+export async function fetchUserCount(): Promise<number> {
+  const res = await fetch(`${API}/api/v1/meta/users/count`);
+  if (!res.ok) throw new Error("读取用户总数失败");
+  const data = (await res.json()) as { total?: number };
+  return Number(data.total ?? 0);
+}
+
+/** 分页拉取 DB 全量用户（后端单页最多 500） */
+export async function fetchAllUsers(): Promise<UserListItem[]> {
+  const total = await fetchUserCount();
+  if (total <= 0) return fetchUsers(500, 0);
+  const pageSize = 500;
+  const items: UserListItem[] = [];
+  for (let offset = 0; offset < total; offset += pageSize) {
+    const batch = await fetchUsers(Math.min(pageSize, total - offset), offset);
+    items.push(...batch);
+    if (batch.length < pageSize) break;
+  }
+  return items;
+}
+
+export async function fetchWelcome(userId: string): Promise<{ welcome: string; source: string }> {
+  const res = await fetch(`${API}/api/v1/chat/welcome`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ user_id: userId }),
+    cache: "no-store",
+  });
+  if (!res.ok) throw new Error("生成欢迎语失败");
+  return res.json();
+}
+
+export async function fetchServiceContext(userId?: string): Promise<ServiceContext> {
+  const uid = userId ?? getStoredUserId();
+  const res = await fetch(`${API}/api/v1/users/${uid}/service-context`);
   if (!res.ok) throw new Error("读取生活服务上下文失败");
   return res.json();
 }
@@ -58,7 +126,10 @@ export async function streamChat(
       pipeline: { steps?: PipelineStep[] };
       service_cards?: unknown[];
       case?: Record<string, unknown>;
+      focus_order_id?: string | null;
+      agent_trace?: Array<Record<string, unknown>>;
     }) => void;
+    onThinking?: (payload: { line?: string }) => void;
     onToken?: (text: string) => void;
     onDone?: (data: Record<string, unknown>) => void;
     onError?: (err: Error) => void;
@@ -99,6 +170,8 @@ export async function streamChat(
         try {
           const parsed = JSON.parse(data);
           if (event === "pipeline") handlers.onPipeline?.(parsed);
+          if (event === "react_step") handlers.onPipeline?.(parsed);
+          if (event === "thinking" && parsed.line) handlers.onThinking?.(parsed);
           if (event === "token" && parsed.text) handlers.onToken?.(parsed.text);
           if (event === "error") {
             handlers.onError?.(new Error(String(parsed.message ?? "服务端处理失败")));
@@ -122,6 +195,8 @@ export async function streamChat(
         try {
           const parsed = JSON.parse(data);
           if (event === "pipeline") handlers.onPipeline?.(parsed);
+          if (event === "react_step") handlers.onPipeline?.(parsed);
+          if (event === "thinking" && parsed.line) handlers.onThinking?.(parsed);
           if (event === "token" && parsed.text) handlers.onToken?.(parsed.text);
           if (event === "error") {
             handlers.onError?.(new Error(String(parsed.message ?? "服务端处理失败")));
@@ -152,11 +227,16 @@ export async function streamChat(
   }
 }
 
-export async function createRefund(sessionId: string, orderId: string, reason: string) {
+export async function createRefund(sessionId: string, orderId: string, reason: string, userId?: string) {
   const res = await fetch(`${API}/api/v1/refunds`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ session_id: sessionId, order_id: orderId, reason }),
+    body: JSON.stringify({
+      session_id: sessionId,
+      order_id: orderId,
+      reason,
+      user_id: userId ?? getStoredUserId(),
+    }),
   });
   if (!res.ok) throw new Error("退款申请失败");
   return res.json();
@@ -173,7 +253,8 @@ export async function executeWorkflowAction(
   actionId: string,
   orderId?: string,
   voucherId?: string,
-  payload?: Record<string, unknown>
+  payload?: Record<string, unknown>,
+  userId?: string
 ) {
   const res = await fetch(`${API}/api/v1/workflow/actions`, {
     method: "POST",
@@ -184,15 +265,30 @@ export async function executeWorkflowAction(
       order_id: orderId,
       voucher_id: voucherId,
       payload: payload ?? {},
+      user_id: userId ?? getStoredUserId(),
     }),
   });
   if (!res.ok) throw new Error("工作流动作执行失败");
   return res.json();
 }
 
-export async function fetchOperationLogs(userId = "user_demo", sessionId?: string) {
+export async function fetchFulfillmentTimeline(userId: string, orderId: string) {
+  const res = await fetch(`${API}/api/v1/users/${userId}/orders/${orderId}/fulfillment-timeline`);
+  if (!res.ok) throw new Error("读取服务进度失败");
+  return res.json() as Promise<{ stages?: import("../components/ServicePanels").TimelineStage[]; order_title?: string }>;
+}
+
+export async function fetchServiceRecords(userId?: string) {
+  const uid = userId ?? getStoredUserId();
+  const res = await fetch(`${API}/api/v1/users/${uid}/service-records`);
+  if (!res.ok) throw new Error("读取服务记录失败");
+  return res.json() as Promise<{ count?: number; records?: import("../components/ServicePanels").ServiceRecord[] }>;
+}
+
+export async function fetchOperationLogs(userId?: string, sessionId?: string) {
+  const uid = userId ?? getStoredUserId();
   const query = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : "";
-  const res = await fetch(`${API}/api/v1/users/${userId}/operation-logs${query}`);
+  const res = await fetch(`${API}/api/v1/users/${uid}/operation-logs${query}`);
   if (!res.ok) throw new Error("读取操作记录失败");
   return res.json();
 }

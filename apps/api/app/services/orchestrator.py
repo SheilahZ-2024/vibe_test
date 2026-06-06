@@ -1,29 +1,29 @@
+"""对话入口 — 将 HTTP/SSE 请求委托给 FulfillmentAgent（ReAct），不再维护固定流水线。"""
+
+from __future__ import annotations
+
 import time
 from collections.abc import AsyncIterator
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.diagnosis import DiagnosisContext, DiagnosisEngine
 from app.models.entities import ConversationEvent
-from app.repositories.life_service import KnowledgeRepository, OperationLogRepository
+from app.repositories.life_service import OperationLogRepository
 from app.schemas.api import ChatRequest, EdgeContextPacket
 from app.services.context import ServiceContextBuilder
-from app.services.intent import ACTIONABLE_INTENTS, IntentClassifier, IntentResult
+from app.services.fulfillment_agent import FulfillmentAgent
 from app.services.llm import LLMService
-from app.services.prompts import build_system_prompt
 from app.services.sessions import SessionStore
-from app.services.tools import LifeServiceTools
 
 
 class ChatOrchestrator:
+    """命名保留以兼容 chat 路由；职责仅为会话 I/O + 日志，业务决策全部由 FulfillmentAgent 完成。"""
+
     def __init__(self):
+        self.agent = FulfillmentAgent()
         self.context_builder = ServiceContextBuilder()
-        self.knowledge = KnowledgeRepository()
         self.operation_logs = OperationLogRepository()
-        self.tools = LifeServiceTools()
         self.llm = LLMService()
-        self.intent_classifier = IntentClassifier(self.llm)
-        self.diagnosis_engine = DiagnosisEngine()
 
     async def run_stream(
         self,
@@ -34,93 +34,173 @@ class ChatOrchestrator:
         started = time.perf_counter()
         edge = body.edge_context or EdgeContextPacket()
         user_id = edge.user_id
+        if not await self.context_builder.users.get(db, user_id):
+            raise ValueError(f"用户不存在: {user_id}")
+
         session_id = body.session_id or await store.create(user_id)
         await store.refresh(session_id, user_id)
+        history = await store.get_messages(session_id)
 
         pipeline: dict = {"steps": []}
-        tool_calls: list[dict] = []
 
         def step(name: str, detail: str = "", status: str = "done") -> None:
             pipeline["steps"].append({"name": name, "status": status, "detail": detail})
 
-        history = await store.get_messages(session_id)
-        intent_result = await self.intent_classifier.classify(body.message, history)
-        intent = intent_result.route_intent
-        step("intent_detect", intent_result.to_pipeline_detail())
-
         service_context = await self.context_builder.build(db, edge, user_id)
-        step("service_context", f"{len(service_context['orders'])} orders, {len(service_context['vouchers'])} vouchers")
+        step("service_context", f"{len(service_context['orders'])} orders, focus={edge.focus_order_id or 'none'}")
 
-        knowledge_hits: list = []
-        if intent not in ("chitchat",):
-            knowledge_hits = await self.knowledge.search(db, body.message)
-            step("knowledge_search", f"{len(knowledge_hits)} articles")
-        else:
-            step("knowledge_search", "skipped (chitchat)")
-
-        diagnosis_result = None
+        agent_trace: list[dict] = []
+        intent = "clarify"
+        intent_meta: dict = {}
+        focus_order_id = edge.focus_order_id
+        tool_calls: list[dict] = []
         workflow_payload: dict | None = None
+        agent_finish: dict = {}
 
-        if intent in ACTIONABLE_INTENTS or intent in ("clarify", "chitchat"):
-            dx_ctx = await self.tools.build_diagnosis_context(db, user_id, body.message, service_context)
-            diagnosis_result = self.diagnosis_engine.diagnose(intent, dx_ctx)
-            step(
-                "diagnosis_tree",
-                f"{diagnosis_result.case_id} {diagnosis_result.case_name} ({diagnosis_result.escalation})",
-            )
-            workflow_payload = diagnosis_result.to_dict()
-            step("case_generate", f"{diagnosis_result.case_id} — {diagnosis_result.user_goal}")
+        def on_react_step(trace_step, state) -> None:
+            agent_trace.append(trace_step.to_dict())
 
-            if intent in ACTIONABLE_INTENTS:
-                tool_calls = await self.tools.run_diagnosis_tools(db, session_id, user_id, intent, diagnosis_result, dx_ctx)
-                step("tool_action", f"{len(tool_calls)} calls")
-            else:
-                step("tool_action", "skipped (clarify/chitchat)")
-        else:
-            step("diagnosis_tree", "skipped")
-            step("case_generate", "skipped")
-            step("tool_action", "0 calls")
+        def pipeline_payload(case: dict | None = None) -> dict:
+            return {
+                "session_id": session_id,
+                "intent": intent,
+                "intent_meta": intent_meta,
+                "pipeline": pipeline,
+                "service_cards": self._cards(service_context),
+                "case": case,
+                "focus_order_id": focus_order_id,
+                "agent_trace": agent_trace,
+            }
 
-        system = build_system_prompt(service_context, intent_result, diagnosis_result, knowledge_hits, tool_calls)
-        step("prompt_build", f"{len(system)} chars")
+        yield "pipeline", pipeline_payload()
+
+        agent_result = None
+        async for event, payload in self.agent.run_stream(
+            db,
+            store,
+            session_id=session_id,
+            user_id=user_id,
+            message=body.message,
+            edge=edge,
+            history=history,
+            service_context=service_context,
+            on_step=on_react_step,
+        ):
+            if event == "context_ready":
+                intent = payload.get("intent", intent)
+                intent_meta = payload.get("intent_meta") or {}
+                focus_order_id = payload.get("focus_order_id") or focus_order_id
+                step(
+                    "intent_detect",
+                    f"[{intent_meta.get('route_category', '?')}] {intent} "
+                    f"({int((intent_meta.get('confidence') or 0) * 100)}%, agent)",
+                )
+                titles = payload.get("knowledge_titles") or []
+                step("knowledge_search", ", ".join(titles[:3]) if titles else "0 articles")
+                yield "pipeline", pipeline_payload()
+            elif event == "react_step":
+                trace_step = payload.get("step") or {}
+                focus_order_id = payload.get("focus_order_id") or focus_order_id
+                action = trace_step.get("action", "?")
+                thought = str(trace_step.get("thought") or "")[:80]
+                step("agent_react", f"#{trace_step.get('step', '?')} {action}: {thought}")
+                yield "pipeline", pipeline_payload()
+            elif event == "thinking":
+                yield "thinking", payload
+            elif event == "agent":
+                intent = payload.get("intent", intent)
+                intent_meta = payload.get("intent_meta") or {}
+                focus_order_id = payload.get("focus_order_id") or focus_order_id
+                agent_finish = payload.get("finish") or {}
+                if agent_finish.get("mode") == "clarify":
+                    step("agent_decision", "clarify — 大模型判断需先澄清")
+                else:
+                    step("agent_decision", f"reply — safe={agent_finish.get('safe_to_send', True)}")
+                step("tool_action", f"{payload.get('tool_count', 0)} calls via ReAct")
+                yield "pipeline", pipeline_payload()
+            elif event == "token":
+                yield "token", payload
+            elif event == "result":
+                agent_result = payload
+                agent_finish = agent_result.finish.to_dict()
+
+        if agent_result is None:
+            raise RuntimeError("Agent 未返回结果")
+
+        tool_calls = agent_result.tool_calls
+        focus_order_id = agent_result.focus_order_id or focus_order_id
+        workflow_payload = agent_result.workflow_payload
+
+        step("model_response", f"{self.llm.mode} {agent_result.reply_source} {round(time.perf_counter() - started, 2)}s")
+
+        reply = agent_result.finish.draft_message
+        pipeline["model"] = {"mode": self.llm.mode, "latency_s": round(time.perf_counter() - started, 2)}
 
         await store.append_message(session_id, "user", body.message)
-        await self._log(db, session_id, user_id, "user", body.message, intent, [], {"edge": edge.model_dump(), "intent_meta": self._intent_meta(intent_result), "case_id": (diagnosis_result.case_id if diagnosis_result else None)})
-        if diagnosis_result:
-            await self._operation_log(db, session_id, user_id, "diagnose", "agent", f"Case {diagnosis_result.case_id}: {diagnosis_result.case_name}", workflow_payload)
+        await self._log(
+            db,
+            session_id,
+            user_id,
+            "user",
+            body.message,
+            intent,
+            [],
+            {
+                "edge": edge.model_dump(),
+                "intent_meta": intent_meta,
+                "focus_order_id": focus_order_id,
+                "agent_trace": agent_trace,
+                "agent_finish": agent_finish,
+            },
+        )
 
-        yield "pipeline", {
-            "session_id": session_id,
-            "intent": intent,
-            "intent_meta": self._intent_meta(intent_result),
-            "pipeline": pipeline,
-            "service_cards": self._cards(service_context),
-            "case": workflow_payload,
-        }
-
-        full = []
-        async for chunk in self.llm.stream_reply(system, history, body.message):
-            full.append(chunk)
-            yield "token", {"text": chunk}
-
-        reply = "".join(full)
-        latency = round(time.perf_counter() - started, 2)
-        pipeline["model"] = {"mode": self.llm.mode, "latency_s": latency}
-        step("model_response", f"{self.llm.mode} {latency}s")
         await store.append_message(session_id, "assistant", reply)
-        await self._log(db, session_id, user_id, "assistant", reply, intent, tool_calls, {"pipeline": pipeline, "intent_meta": self._intent_meta(intent_result)})
-        await self._operation_log(db, session_id, user_id, "reply", "agent", reply[:120], {"intent": intent, "case_id": diagnosis_result.case_id if diagnosis_result else None})
+        await self._log(
+            db,
+            session_id,
+            user_id,
+            "assistant",
+            reply,
+            intent,
+            tool_calls,
+            {"pipeline": pipeline, "intent_meta": intent_meta, "agent_finish": agent_finish},
+        )
+
+        if workflow_payload:
+            await self._operation_log(
+                db,
+                session_id,
+                user_id,
+                "diagnose",
+                "agent",
+                f"Agent 采纳 Case {workflow_payload.get('case_id')}",
+                workflow_payload,
+            )
+
+        await self._operation_log(
+            db,
+            session_id,
+            user_id,
+            "reply",
+            "agent",
+            reply[:120],
+            {"intent": intent, "case_id": workflow_payload.get("case_id") if workflow_payload else None},
+        )
 
         yield "done", {
             "session_id": session_id,
             "reply": reply,
             "intent": intent,
-            "intent_meta": self._intent_meta(intent_result),
+            "intent_meta": intent_meta,
             "pipeline": pipeline,
             "service_cards": self._cards(service_context),
             "tool_calls": tool_calls,
             "workflow": workflow_payload,
             "case": workflow_payload,
+            "focus_order_id": focus_order_id,
+            "agent_trace": agent_trace,
+            "agent_finish": agent_finish,
+            "pending_confirmations": [p.to_dict() for p in agent_result.pending_confirmations],
         }
 
     async def run_once(self, db: AsyncSession, store: SessionStore, body: ChatRequest) -> dict:
@@ -130,22 +210,11 @@ class ChatOrchestrator:
                 result = payload
         return result or {}
 
-    def _intent_meta(self, intent_result: IntentResult) -> dict:
-        return {
-            "raw_intent": intent_result.raw_intent,
-            "route_intent": intent_result.route_intent,
-            "confidence": intent_result.confidence,
-            "needs_clarify": intent_result.needs_clarify,
-            "source": intent_result.source,
-            "reasoning": intent_result.reasoning,
-            "alternatives": intent_result.alternatives,
-        }
-
     def _cards(self, ctx: dict) -> list[dict]:
         cards: list[dict] = []
-        for order in ctx.get("orders", [])[:3]:
+        for order in ctx.get("orders", []):
             cards.append({"type": "order", "title": order["title"], "status": order["status"], "payload": order})
-        for voucher in ctx.get("vouchers", [])[:2]:
+        for voucher in ctx.get("vouchers", [])[:3]:
             cards.append({"type": "voucher", "title": voucher["title"], "status": voucher["status"], "payload": voucher})
         for coupon in ctx.get("coupons", [])[:2]:
             cards.append({"type": "coupon", "title": coupon["title"], "status": coupon["status"], "payload": coupon})
@@ -154,12 +223,29 @@ class ChatOrchestrator:
         return cards
 
     async def _log(self, db, session_id, user_id, role, content, intent, tool_calls, metadata) -> None:
-        db.add(ConversationEvent(session_id=session_id, user_id=user_id, role=role, content=content, intent=intent, tool_calls=tool_calls, metadata_=metadata))
+        db.add(
+            ConversationEvent(
+                session_id=session_id,
+                user_id=user_id,
+                role=role,
+                content=content,
+                intent=intent,
+                tool_calls=tool_calls,
+                metadata_=metadata,
+            )
+        )
         await db.commit()
 
     async def _operation_log(self, db, session_id, user_id, operation_type, actor, summary, payload=None) -> None:
         try:
-            await self.operation_logs.create(db, session_id=session_id, user_id=user_id, operation_type=operation_type, actor=actor, summary=summary, payload=payload)
+            await self.operation_logs.create(
+                db,
+                session_id=session_id,
+                user_id=user_id,
+                operation_type=operation_type,
+                actor=actor,
+                summary=summary,
+                payload=payload,
+            )
         except Exception:
             await db.rollback()
-

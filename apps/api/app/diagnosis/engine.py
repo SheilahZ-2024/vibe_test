@@ -6,12 +6,18 @@ from datetime import datetime, timezone
 
 from app.diagnosis.matrices import resolve_actions
 from app.diagnosis.registry import CASE_REGISTRY, INTENT_TO_DEFAULT_CASE
-from app.diagnosis.storybook import match_case_hint
 from app.diagnosis.types import CaseDiagnosisResult, DiagnosisContext, DiagnosisStep
 
 
 def _meta(obj: dict | None) -> dict:
-    return obj if isinstance(obj, dict) else {}
+    """将 order/store 等实体与其 JSONB metadata 合并为扁平视图，供诊断树读取。"""
+    if not isinstance(obj, dict):
+        return {}
+    merged = dict(obj)
+    nested = obj.get("metadata")
+    if isinstance(nested, dict):
+        merged.update(nested)
+    return merged
 
 
 def _parse_dt(value: object) -> datetime | None:
@@ -35,20 +41,6 @@ def _has_reservation(order: dict | None) -> bool:
 class DiagnosisEngine:
     def diagnose(self, intent: str, ctx: DiagnosisContext) -> CaseDiagnosisResult:
         msg = ctx.message
-
-        # Storybook 强提示路由
-        hint = match_case_hint(msg)
-        if hint and intent in ("clarify", hint[0], "VoucherUnavailable", "QueryOrder", "ServiceMismatch"):
-            hinted_intent, case_id = hint
-            if intent == "clarify":
-                intent = hinted_intent
-            return self._from_case(
-                case_id,
-                intent,
-                ctx,
-                [DiagnosisStep(1, "Storybook匹配", "pass", f"口语映射至 {case_id}", None, case_id)],
-                "high",
-            )
 
         if intent in ("clarify", "chitchat"):
             case_id = "CLARIFY" if intent == "clarify" else "CHITCHAT"
@@ -241,7 +233,9 @@ class DiagnosisEngine:
             return self._from_case("PC-008", "VoucherUnavailable", ctx, steps, "high")
         steps.append(DiagnosisStep(5, "门店匹配", "pass", "ok"))
 
-        if vm.get("time_restricted") and vm.get("allowed_now") is False:
+        time_limited = om.get("time_restricted") or vm.get("time_restricted")
+        allowed_now = om.get("allowed_now") if om.get("time_restricted") else vm.get("allowed_now")
+        if time_limited and allowed_now is False:
             steps.append(DiagnosisStep(6, "时段规则", "fail", "当前时段不可用", "VoucherTimeMismatch", "PC-009"))
             return self._from_case("PC-009", "VoucherUnavailable", ctx, steps, "high")
         steps.append(DiagnosisStep(6, "时段规则", "pass", "ok"))
@@ -275,7 +269,7 @@ class DiagnosisEngine:
         if v.get("status") == "frozen":
             steps.append(DiagnosisStep(10, "系统状态", "fail", "券冻结", "VoucherFrozen", "PC-007"))
             return self._from_case("PC-007", "VoucherUnavailable", ctx, steps, "high")
-        if vm.get("qr_invalid") or sm.get("scanner_synced") is False:
+        if om.get("qr_invalid") or vm.get("qr_invalid") or sm.get("scanner_synced") is False:
             steps.append(DiagnosisStep(10, "系统状态", "warning", "扫码/二维码异常", "SystemVerificationFailed", "FC-008"))
             return self._from_case("FC-008", "VoucherUnavailable", ctx, steps, "medium")
         if om.get("campaign_ended"):

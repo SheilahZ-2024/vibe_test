@@ -1,10 +1,8 @@
 const journey = [
-  ["发现", "已选套餐"],
   ["购买", "已支付"],
   ["预约", "可预约"],
   ["到店", "待到店"],
   ["核销", "待处理"],
-  ["消费", "—"],
   ["售后", "—"],
 ];
 
@@ -36,9 +34,9 @@ export function FulfillmentContextCard({
       <div className="flex items-start justify-between gap-2">
         <button type="button" onClick={onOpenOrder} className="min-w-0 flex-1 text-left">
           <div className="text-[10px] font-semibold text-[#fe2c55]">当前履约</div>
-          <div className="mt-0.5 truncate text-sm font-bold text-slate-900">{text(orderTitle, "川巷子火锅双人餐")}</div>
+          <div className="mt-0.5 truncate text-sm font-bold text-slate-900">{text(orderTitle, "当前订单")}</div>
           <div className="mt-0.5 text-[10px] text-slate-500">
-            {text(userName, "小林")} · {text(city, "北京")} · 实付 ¥{text(paidAmount, "168")}
+            {text(userName, "—")} · {text(city, "—")} · 实付 ¥{text(paidAmount, "—")}
             {voucherCode ? ` · 券码 ${voucherCode}` : ""}
           </div>
         </button>
@@ -52,9 +50,9 @@ export function FulfillmentContextCard({
             <div
               key={title}
               className={`min-w-[52px] shrink-0 rounded-xl px-1.5 py-1 text-center ${
-                index < 4
+                index < 2
                   ? "bg-emerald-50 text-emerald-700"
-                  : index === 4
+                  : index === 3
                     ? "bg-[#fff1f3] text-[#fe2c55]"
                     : "bg-slate-100 text-slate-400"
               }`}

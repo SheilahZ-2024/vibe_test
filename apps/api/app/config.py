@@ -43,14 +43,38 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("LLM_TIMEOUT_SECONDS", "OPENAI_TIMEOUT_SECONDS"),
     )
     llm_fallback_to_mock: bool = Field(
-        default=True,
+        default=False,
         validation_alias=AliasChoices("LLM_FALLBACK_TO_MOCK", "OPENAI_FALLBACK_TO_MOCK"),
+    )
+    llm_require_live: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("LLM_REQUIRE_LIVE"),
     )
 
     intent_confidence_threshold: float = Field(default=0.65, validation_alias=AliasChoices("INTENT_CONFIDENCE_THRESHOLD"))
     intent_use_llm: bool = Field(default=True, validation_alias=AliasChoices("INTENT_USE_LLM"))
     intent_llm_temperature: float = Field(default=0.1, validation_alias=AliasChoices("INTENT_LLM_TEMPERATURE"))
     intent_llm_max_tokens: int = Field(default=256, validation_alias=AliasChoices("INTENT_LLM_MAX_TOKENS"))
+
+    agent_max_steps: int = Field(default=5, validation_alias=AliasChoices("AGENT_MAX_STEPS"))
+    agent_react_temperature: float = Field(default=0.2, validation_alias=AliasChoices("AGENT_REACT_TEMPERATURE"))
+    agent_react_max_tokens: int = Field(default=512, validation_alias=AliasChoices("AGENT_REACT_MAX_TOKENS"))
+    agent_history_max_turns: int = Field(default=4, validation_alias=AliasChoices("AGENT_HISTORY_MAX_TURNS"))
+    agent_skip_final_llm_when_draft: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("AGENT_SKIP_FINAL_LLM_WHEN_DRAFT"),
+    )
+    agent_draft_min_chars: int = Field(default=24, validation_alias=AliasChoices("AGENT_DRAFT_MIN_CHARS"))
+    agent_react_observation_limit: int = Field(default=350, validation_alias=AliasChoices("AGENT_REACT_OBSERVATION_LIMIT"))
+    agent_knowledge_content_limit: int = Field(default=180, validation_alias=AliasChoices("AGENT_KNOWLEDGE_CONTENT_LIMIT"))
+
+    agent_tone_polish_enabled: bool = Field(default=True, validation_alias=AliasChoices("AGENT_TONE_POLISH_ENABLED"))
+    agent_tone_polish_temperature: float = Field(
+        default=0.72,
+        validation_alias=AliasChoices("AGENT_TONE_POLISH_TEMPERATURE"),
+    )
+    agent_tone_polish_max_tokens: int = Field(default=384, validation_alias=AliasChoices("AGENT_TONE_POLISH_MAX_TOKENS"))
+    agent_tone_polish_min_chars: int = Field(default=8, validation_alias=AliasChoices("AGENT_TONE_POLISH_MIN_CHARS"))
 
     api_secret_key: str = "dev-secret-change-me"
     cors_origins: str = "http://localhost:5173,http://localhost:3000"

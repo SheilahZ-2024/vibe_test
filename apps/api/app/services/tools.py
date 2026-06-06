@@ -29,23 +29,35 @@ class LifeServiceTools:
         self.operation_logs = OperationLogRepository()
         self.diagnosis_engine = DiagnosisEngine()
 
+    @staticmethod
+    def _pick_primary_ids(service_context: dict, focus_order_id: str | None = None) -> tuple[str | None, str | None]:
+        orders = service_context.get("orders") or []
+        vouchers = service_context.get("vouchers") or []
+        order = None
+        if focus_order_id:
+            order = next((o for o in orders if str(o.get("id")) == str(focus_order_id)), None)
+        elif len(orders) == 1:
+            order = orders[0]
+        if not order:
+            return None, None
+        order_id = str(order["id"])
+        voucher = next((v for v in vouchers if str(v.get("order_id")) == order_id), None)
+        voucher_id = str(voucher["id"]) if voucher and voucher.get("id") else None
+        return order_id, voucher_id
+
     async def build_diagnosis_context(
         self,
         db: AsyncSession,
         user_id: str,
         message: str,
         service_context: dict,
+        focus_order_id: str | None = None,
     ) -> DiagnosisContext:
-        order_id = "order_hotpot_8821"
-        voucher_id = "voucher_hotpot_8821"
-        if service_context.get("orders"):
-            order_id = str(service_context["orders"][0].get("id", order_id))
-        if service_context.get("vouchers"):
-            voucher_id = str(service_context["vouchers"][0].get("id", voucher_id))
+        order_id, voucher_id = self._pick_primary_ids(service_context, focus_order_id)
 
-        order_payload = await self.query_order(db, user_id, order_id)
-        voucher_payload = await self.query_voucher(db, user_id, voucher_id)
-        store_payload = await self.query_store(db, user_id, order_id)
+        order_payload = await self.query_order(db, user_id, order_id) if order_id else {"found": False}
+        voucher_payload = await self.query_voucher(db, user_id, voucher_id) if voucher_id else {"vouchers": []}
+        store_payload = await self.query_store(db, user_id, order_id) if order_id else {"store": None}
         coupon_payload = await self.query_coupon(db, user_id)
         refund_list = service_context.get("refunds") or []
 
@@ -70,51 +82,24 @@ class LifeServiceTools:
             vouchers=voucher_payload.get("vouchers") or [],
         )
 
-    async def run_diagnosis_tools(
+    async def _resolve_workflow_ids(
         self,
         db: AsyncSession,
-        session_id: str,
         user_id: str,
-        intent: str,
-        diagnosis: CaseDiagnosisResult,
-        dx_ctx: DiagnosisContext,
-    ) -> list[dict]:
-        """按 Case 前缀与 Intent 执行查询/写操作工具。"""
-        tool_calls: list[dict] = []
-        order_id = (dx_ctx.order or {}).get("id")
-        voucher_id = (dx_ctx.voucher or {}).get("id")
-        cid = diagnosis.case_id
-
-        prefixes_need_order = ("IC-", "PC-", "AC-", "FC-", "CC-012")
-        if intent in ("QueryOrder", "RefundRequest", "QueryRefund", "CheckRefundEligibility") or cid.startswith(prefixes_need_order):
-            tool_calls.append({"name": "query_order", "result": await self.query_order(db, user_id, order_id)})
-
-        if intent in ("QueryVoucher", "VoucherUnavailable", "CheckVoucherAvailability") or cid.startswith(("IC-00", "PC-0")):
-            tool_calls.append({"name": "query_voucher", "result": await self.query_voucher(db, user_id, voucher_id)})
-
-        if intent in ("QueryStore", "StoreUnavailable") or cid.startswith(("IC-008", "FC-00", "FC-01", "FC-02", "FC-003", "FC-004", "FC-005", "FC-019")):
-            tool_calls.append({"name": "query_store", "result": await self.query_store(db, user_id, order_id)})
-
-        if intent == "QueryCoupon" or cid.startswith(("IC-007", "PC-012", "PC-013", "PC-014")):
-            tool_calls.append({"name": "query_coupon", "result": await self.query_coupon(db, user_id)})
-
-        if intent in ("RefundRequest", "QueryRefund", "CompensationRequest", "AppealRequest") or cid.startswith("AC-"):
-            tool_calls.append({"name": "query_refund", "result": await self.query_refund(db, user_id, order_id)})
-
-        if cid in ("AC-008",) or intent == "QueryTicket":
-            tool_calls.append({"name": "query_ticket", "result": await self.query_ticket(db, user_id, session_id)})
-
-        tool_calls.append({"name": "run_diagnosis", "result": diagnosis.to_dict()})
-
-        if intent == "HumanTransfer":
-            ticket = await self.transfer_to_human(db, session_id, user_id, order_id, {"reason": dx_ctx.message, "case_id": cid})
-            tool_calls.append({"name": "transfer_to_human", "result": {"ticket_id": ticket.id, "priority": ticket.priority}})
-
-        if diagnosis.escalation == "P0" and intent not in ("HumanTransfer",):
-            ticket = await self.create_service_ticket(db, session_id, user_id, order_id, "escalation_p0", {"case_id": cid, "escalation": "P0"})
-            tool_calls.append({"name": "create_ticket", "result": {"ticket_id": ticket.id, "priority": "high"}})
-
-        return tool_calls
+        order_id: str | None,
+        voucher_id: str | None,
+    ) -> tuple[str | None, str | None]:
+        if order_id and voucher_id:
+            return order_id, voucher_id
+        orders = await self.orders.list_for_user(db, user_id, limit=8)
+        if not order_id and orders:
+            active = next((o for o in orders if o.status in ("unused", "scheduled", "paid_pending_voucher")), orders[0])
+            order_id = active.id
+        if order_id and not voucher_id:
+            voucher_rows = await self.vouchers.list_for_user(db, user_id, limit=10)
+            match = next((v for v in voucher_rows if v.order_id == order_id), None)
+            voucher_id = match.id if match else (voucher_rows[0].id if voucher_rows else None)
+        return order_id, voucher_id
 
     async def query_ticket(self, db: AsyncSession, user_id: str, session_id: str | None = None) -> dict:
         from sqlalchemy import select
@@ -258,8 +243,16 @@ class LifeServiceTools:
         order_id: str | None = None,
         voucher_id: str | None = None,
     ) -> dict:
-        order_id = order_id or "order_hotpot_8821"
-        voucher_id = voucher_id or "voucher_hotpot_8821"
+        if not order_id or not voucher_id:
+            orders = await self.orders.list_for_user(db, user_id, limit=5)
+            order_id = order_id or (orders[0].id if orders else None)
+            if order_id:
+                voucher_rows = await self.vouchers.list_for_user(db, user_id, limit=10)
+                match = next((v for v in voucher_rows if v.order_id == order_id), None)
+                voucher_id = voucher_id or (match.id if match else (voucher_rows[0].id if voucher_rows else None))
+        if not order_id:
+            return {"found": False, "reason": "用户暂无订单，无法诊断核销问题"}
+
         order_payload = await self.query_order(db, user_id, order_id)
         voucher_payload = await self.query_voucher(db, user_id, voucher_id)
         store_payload = await self.query_store(db, user_id, order_id)
@@ -384,14 +377,19 @@ class LifeServiceTools:
         payload: dict | None = None,
     ) -> dict:
         payload = payload or {}
+        order_id, voucher_id = await self._resolve_workflow_ids(db, user_id, order_id, voucher_id)
+        if not order_id and action_id not in ("human_handoff",):
+            return {"ok": False, "reason": "未找到可操作的订单"}
         if action_id == "regenerate_qr":
-            result = await self.regenerate_voucher_qr(db, user_id, voucher_id or "voucher_hotpot_8821")
+            if not voucher_id:
+                return {"ok": False, "reason": "未找到可操作的券码"}
+            result = await self.regenerate_voucher_qr(db, user_id, voucher_id)
         elif action_id == "contact_merchant":
-            result = await self.contact_merchant(db, user_id, order_id or "order_hotpot_8821", payload.get("reason", "核销协助"))
+            result = await self.contact_merchant(db, user_id, order_id, payload.get("reason", "核销协助"))
         elif action_id == "create_reservation":
-            result = await self.create_reservation(db, user_id, order_id or "order_hotpot_8821", payload.get("slot"))
+            result = await self.create_reservation(db, user_id, order_id, payload.get("slot"))
         elif action_id == "apply_refund":
-            case = await self.create_refund_case(db, user_id, order_id or "order_hotpot_8821", payload.get("reason", "券无法核销申请退款"))
+            case = await self.create_refund_case(db, user_id, order_id, payload.get("reason", "用户申请退款"))
             result = {"ok": True, "refund_id": case.id, "status": case.status}
         elif action_id == "human_handoff":
             ticket = await self.transfer_to_human(db, session_id, user_id, order_id, payload)

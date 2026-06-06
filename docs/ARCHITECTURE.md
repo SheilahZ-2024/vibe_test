@@ -54,6 +54,8 @@ flowchart TB
 | `refund_cases` | 退款/售后 |
 | `knowledge_articles` | 服务知识库 |
 | `service_tickets` | 转人工/售后工单 |
+| `fulfillment_events` | 履约事件（购买/预约/核销/退款等） |
+| `agent_operation_logs` | 助手操作记录（会话产生，mock seed 不预填） |
 | `conversation_events` | 对话与工具调用日志 |
 
 ## 一次对话数据流

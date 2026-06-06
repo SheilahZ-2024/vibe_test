@@ -44,28 +44,64 @@ install_docker() {
 
 install_docker
 
-if ! docker compose version &>/dev/null 2>&1; then
-  echo "    安装 Docker Compose 插件..."
-  if command -v dnf &>/dev/null; then
-    dnf install -y docker-compose-plugin 2>/dev/null || true
-  elif command -v yum &>/dev/null; then
-    yum install -y docker-compose-plugin 2>/dev/null || true
-  elif command -v apt-get &>/dev/null; then
-    apt-get update -qq && apt-get install -y docker-compose-plugin 2>/dev/null || true
+ensure_compose() {
+  if docker compose version &>/dev/null 2>&1; then
+    DOCKER_COMPOSE=(docker compose)
+    echo "    使用 docker compose 插件"
+    return 0
   fi
-fi
-
-if ! docker compose version &>/dev/null 2>&1 && command -v docker-compose &>/dev/null; then
-  echo "    使用 docker-compose 命令兼容模式"
-  docker() {
-    if [[ "$1" == "compose" ]]; then
-      shift
-      command docker-compose "$@"
-    else
-      command docker "$@"
+  if [[ -x /usr/local/bin/docker-compose ]]; then
+    DOCKER_COMPOSE=(/usr/local/bin/docker-compose)
+    echo "    使用 /usr/local/bin/docker-compose"
+    return 0
+  fi
+  if command -v docker-compose &>/dev/null; then
+    DOCKER_COMPOSE=(docker-compose)
+    echo "    使用 docker-compose"
+    return 0
+  fi
+  echo "    安装独立 docker-compose …"
+  COMPOSE_BIN="/usr/local/bin/docker-compose"
+  URLS=(
+    "https://github.com/docker/compose/releases/download/v2.24.5/docker-compose-linux-x86_64"
+    "https://mirror.ghproxy.com/https://github.com/docker/compose/releases/download/v2.24.5/docker-compose-linux-x86_64"
+  )
+  for url in "${URLS[@]}"; do
+    if curl -fsSL --connect-timeout 20 --max-time 180 "$url" -o "$COMPOSE_BIN"; then
+      chmod +x "$COMPOSE_BIN"
+      DOCKER_COMPOSE=(/usr/local/bin/docker-compose)
+      echo "    docker-compose 安装成功"
+      return 0
     fi
-  }
-fi
+    echo "    下载失败，尝试下一个镜像 …"
+  done
+  echo "ERROR: 无法安装 docker-compose，请在本机重新运行 deploy_via_ssh.py（会自动上传）" >&2
+  exit 1
+}
+
+ensure_compose
+
+configure_docker_mirror() {
+  echo "==> 配置 Docker 镜像加速（国内服务器拉镜像）"
+  mkdir -p /etc/docker
+  cat >/etc/docker/daemon.json <<'EOF'
+{
+  "registry-mirrors": [
+    "https://docker.m.daocloud.io",
+    "https://docker.1ms.run",
+    "https://hub.rat.dev"
+  ],
+  "log-driver": "json-file",
+  "log-opts": { "max-size": "10m" }
+}
+EOF
+  systemctl daemon-reload
+  systemctl restart docker
+  sleep 2
+  echo "    镜像加速已生效"
+}
+
+configure_docker_mirror
 
 echo "==> 准备 .env"
 if [[ ! -f .env ]]; then
@@ -103,7 +139,7 @@ fi
 export WEB_PORT
 
 echo "==> 构建并启动（生产模式，仅暴露 ${WEB_PORT} 端口）"
-docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+"${DOCKER_COMPOSE[@]}" -f docker-compose.yml -f docker-compose.prod.yml up -d --build
 
 echo ""
 echo "==> 部署完成"
@@ -111,4 +147,4 @@ echo "    访问地址: http://${PUBLIC_IP:-你的公网IP}:${WEB_PORT}"
 echo "    健康检查: curl http://127.0.0.1:${WEB_PORT}/health"
 echo ""
 echo "    若外网无法访问，请在阿里云控制台 → 安全组 → 入方向 放行 TCP ${WEB_PORT}"
-echo "    查看日志: docker compose -f docker-compose.yml -f docker-compose.prod.yml logs -f api web"
+echo "    查看日志: ${DOCKER_COMPOSE[*]} -f docker-compose.yml -f docker-compose.prod.yml logs -f api web"

@@ -3,7 +3,7 @@ import { useEffect, useRef } from "react";
 const ITEMS = [
   { id: "fulfillment" as const, label: "服务进度", desc: "购买→到店→核销全流程" },
   { id: "orders" as const, label: "历史订单", desc: "查看全部订单与券码" },
-  { id: "actions" as const, label: "操作记录", desc: "本次服务的处理记录" },
+  { id: "actions" as const, label: "操作记录", desc: "咨询、退款与办理进度" },
   { id: "settings" as const, label: "授权设置", desc: "数据与隐私授权" },
 ];
 

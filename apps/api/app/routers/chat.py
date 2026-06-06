@@ -2,20 +2,35 @@ import json
 from collections.abc import AsyncIterator
 
 import redis.asyncio as aioredis
-from fastapi import APIRouter, Body, Depends
+from fastapi import APIRouter, Body, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
 
 from app.config import settings
 from app.db.session import get_db
-from app.schemas.api import ChatRequest, ChatResponse, EdgeContextPacket, SessionCreateResponse, TicketCreate, TicketOut
+from app.repositories.life_service import UserRepository
+from app.schemas.api import (
+    ChatRequest,
+    ChatResponse,
+    EdgeContextPacket,
+    SessionCreateResponse,
+    TicketCreate,
+    TicketOut,
+    WelcomeOut,
+    WelcomeRequest,
+)
+from app.services.llm import LLMService
 from app.services.orchestrator import ChatOrchestrator
 from app.services.sessions import SessionStore
 from app.services.tools import LifeServiceTools
+from app.services.welcome import WelcomeService
 
 router = APIRouter(prefix="/api/v1/chat", tags=["chat"])
 orchestrator = ChatOrchestrator()
 tools = LifeServiceTools()
+welcome_service = WelcomeService()
+users_repo = UserRepository()
+llm = LLMService()
 
 
 def get_redis() -> aioredis.Redis:
@@ -27,11 +42,24 @@ async def create_session(
     edge: EdgeContextPacket | None = Body(default=None),
     redis: aioredis.Redis = Depends(get_redis),
 ):
-    user_id = (edge.user_id if edge else None) or "user_demo"
+    user_id = (edge.user_id if edge else None) or "user_001"
     store = SessionStore(redis)
     sid = await store.create(user_id)
     await redis.aclose()
     return SessionCreateResponse(session_id=sid, user_id=user_id)
+
+
+@router.post("/welcome", response_model=WelcomeOut)
+async def generate_welcome(body: WelcomeRequest, db: AsyncSession = Depends(get_db)):
+    user = await users_repo.get(db, body.user_id)
+    if not user:
+        raise HTTPException(404, "User not found")
+    try:
+        text = await welcome_service.generate(db, body.user_id)
+        source = "mock" if llm.use_mock else "llm"
+        return WelcomeOut(user_id=body.user_id, welcome=text, source=source)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
 
 
 @router.post("", response_model=ChatResponse)
@@ -72,7 +100,7 @@ async def create_ticket(
     redis: aioredis.Redis = Depends(get_redis),
 ):
     store = SessionStore(redis)
-    user_id = await store.get_user(body.session_id) or "user_demo"
+    user_id = await store.get_user(body.session_id) or "user_001"
     ticket = await tools.transfer_to_human(db, body.session_id, user_id, body.order_id, body.payload)
     await redis.aclose()
     return TicketOut(
