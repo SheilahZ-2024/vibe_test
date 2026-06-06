@@ -131,6 +131,7 @@ export async function streamChat(
     }) => void;
     onThinking?: (payload: { line?: string }) => void;
     onToken?: (text: string) => void;
+    onReplyReset?: () => void;
     onDone?: (data: Record<string, unknown>) => void;
     onError?: (err: Error) => void;
   },
@@ -172,6 +173,7 @@ export async function streamChat(
           if (event === "pipeline") handlers.onPipeline?.(parsed);
           if (event === "react_step") handlers.onPipeline?.(parsed);
           if (event === "thinking" && parsed.line) handlers.onThinking?.(parsed);
+          if (event === "reply_reset") handlers.onReplyReset?.();
           if (event === "token" && parsed.text) handlers.onToken?.(parsed.text);
           if (event === "error") {
             handlers.onError?.(new Error(String(parsed.message ?? "服务端处理失败")));
@@ -197,6 +199,7 @@ export async function streamChat(
           if (event === "pipeline") handlers.onPipeline?.(parsed);
           if (event === "react_step") handlers.onPipeline?.(parsed);
           if (event === "thinking" && parsed.line) handlers.onThinking?.(parsed);
+          if (event === "reply_reset") handlers.onReplyReset?.();
           if (event === "token" && parsed.text) handlers.onToken?.(parsed.text);
           if (event === "error") {
             handlers.onError?.(new Error(String(parsed.message ?? "服务端处理失败")));

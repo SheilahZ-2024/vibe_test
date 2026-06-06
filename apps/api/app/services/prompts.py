@@ -14,7 +14,8 @@ AGENT_MISSION = """你是抖音生活服务 AI 履约服务管家，通过 ReAct
 原则：双轨参考（规则层+诊断脚本）并行、你综合裁决；信息不足/多订单未聚焦→finish clarify；
 写操作须用户确认；禁止编造数据、盲信任一侧、未聚焦擅自选单。
 效率：尽量 2-4 步内 finish；已有 query 结果勿重复调用相同工具；finish 时 draft_message 写完整用户回复。
-知识库：需要政策/FAQ 支撑时调用 search_knowledge，自行决定 query 与 limit(1~5)，勿预置假设条数。"""
+聚焦订单已预取或已有 query_focus_bundle 结果时，直接 run_diagnosis/search_knowledge 或 finish，勿重复 query。
+知识库：需要政策/FAQ 支撑时调用 search_knowledge，自行决定 query 与 limit(1~5)。"""
 
 REACT_OUTPUT_SCHEMA = """输出一个 JSON（无 markdown）：
 {"thought":"推理","action":"工具名或finish","action_input":{},"focus_order_id":"可选",
@@ -37,6 +38,9 @@ def build_react_system_prompt(state: AgentState, history: list[dict], *, step_id
     rules = prompt_rules_block(intent.route_intent, intent.route_category)
     oral = oral_expression_guidance() if should_include_oral_guidance(intent.route_intent, intent.route_category) else ""
     oral_block = f"\n{oral}\n" if oral else ""
+    prefetch_note = ""
+    if state.prefetch_done:
+        prefetch_note = "\n── 预取 ──\nquery_focus_bundle 已在 ReAct 前执行，勿重复；可直接 run_diagnosis / search_knowledge / finish。\n"
 
     return f"""{AGENT_MISSION}
 
@@ -46,9 +50,9 @@ def build_react_system_prompt(state: AgentState, history: list[dict], *, step_id
 {_intent_guidance(intent)}
 {oral_block}
 {rules}
-
+{prefetch_note}
 ── 可用工具 ──
-{tool_catalog_block(intent=intent.route_intent)}
+{tool_catalog_block(intent=intent.route_intent, exclude=state.executed_tools)}
 
 ── 聚焦订单 ──
 {state.focus_order_id or "未选；多订单时 list_orders 或 finish clarify"}
@@ -56,11 +60,11 @@ def build_react_system_prompt(state: AgentState, history: list[dict], *, step_id
 ── 用户上下文 ──
 {context_summary_for_agent(state.service_context, state.focus_order_id)}
 
-── 知识库（轨道 A）──
+── 知识库 ──
 {knowledge}
 
-── 诊断脚本（轨道 B，若有）──
-{_diagnosis_script_block(state.diagnosis_advisories)}
+── 诊断脚本（若有）──
+{_diagnosis_script_block(state.diagnosis_advisories, compact=True)}
 
 ── 会话摘要 ──
 {_history_block(history)}
@@ -69,17 +73,19 @@ def build_react_system_prompt(state: AgentState, history: list[dict], *, step_id
 
 def _build_react_continuation_prompt(state: AgentState) -> str:
     route_intent = state.intent_result.route_intent
+    executed = state.executed_tools
+    remaining = tool_catalog_block(intent=route_intent, compact=True, executed=executed)
     return f"""{REACT_CONTINUATION_HEADER}
 
-意图：{route_intent} | 聚焦：{state.focus_order_id or "未选"}
+意图：{route_intent} | 聚焦：{state.focus_order_id or "未选"} | 已执行：{", ".join(sorted(executed)) or "无"}
 
-── 工具 ──
-{tool_catalog_block(intent=route_intent, compact=True)}
+── 剩余工具 ──
+{remaining}
 
-── 诊断脚本（轨道 B）──
+── 诊断脚本 ──
 {_diagnosis_script_block(state.diagnosis_advisories, compact=True)}
 
-── 知识库（search_knowledge 结果）──
+── 知识库 ──
 {_knowledge_block(state.knowledge_articles) if state.knowledge_articles else "（未检索）"}
 
 ── 已执行步骤 ──

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from app.config import settings
+
 TOOL_CATALOG: dict[str, dict] = {
     "list_orders": {
         "description": "列出用户全部订单摘要（多订单未聚焦时优先调用）。",
@@ -25,8 +27,8 @@ TOOL_CATALOG: dict[str, dict] = {
     },
     "query_focus_bundle": {
         "description": (
-            "一次并行拉取聚焦订单+关联券+门店（等同 query_order+query_voucher+query_store）。"
-            "已有聚焦 order_id 时优先用此工具，减少往返步数。"
+            "【推荐】一次并行拉取聚焦订单+关联券+门店。"
+            "已有 focus_order_id 时必须优先用此工具，禁止再分别 query_order/query_voucher/query_store。"
         ),
         "parameters": {"order_id": "string 可选，默认当前聚焦订单"},
         "read_only": True,
@@ -114,20 +116,20 @@ WRITE_ACTION_TITLES: dict[str, str] = {
     "human_handoff": "转人工客服",
 }
 
-# 按意图裁剪工具列表，减少 ReAct Prompt token（写工具仍按需包含）
+_ATOMIC_FOCUS_READS = frozenset({"query_order", "query_voucher", "query_store"})
+
+# 按意图裁剪工具列表；有 bundle 时不再暴露原子 query_*（由 settings 控制）
 _INTENT_TOOL_SETS: dict[str, tuple[str, ...]] = {
-    "chitchat": ("list_orders", "human_handoff"),
+    "chitchat": ("human_handoff",),
     "unconfigured": ("list_orders", "human_handoff"),
-    "clarify": ("list_orders", "query_order", "query_voucher", "search_knowledge", "human_handoff"),
-    "QueryOrder": ("list_orders", "query_order", "query_voucher", "search_knowledge", "human_handoff"),
-    "QueryVoucher": ("list_orders", "query_order", "query_voucher", "search_knowledge", "run_diagnosis", "human_handoff"),
+    "clarify": ("list_orders", "query_focus_bundle", "search_knowledge", "human_handoff"),
+    "QueryOrder": ("list_orders", "query_focus_bundle", "search_knowledge", "human_handoff"),
+    "QueryVoucher": ("list_orders", "query_focus_bundle", "search_knowledge", "run_diagnosis", "human_handoff"),
     "QueryCoupon": ("list_orders", "query_coupon", "search_knowledge", "human_handoff"),
-    "QueryStore": ("list_orders", "query_order", "query_store", "search_knowledge", "human_handoff"),
+    "QueryStore": ("list_orders", "query_focus_bundle", "search_knowledge", "human_handoff"),
     "QueryReservation": (
         "list_orders",
         "query_focus_bundle",
-        "query_order",
-        "query_store",
         "search_knowledge",
         "create_reservation",
         "run_diagnosis",
@@ -138,9 +140,6 @@ _INTENT_TOOL_SETS: dict[str, tuple[str, ...]] = {
     "VoucherUnavailable": (
         "list_orders",
         "query_focus_bundle",
-        "query_order",
-        "query_voucher",
-        "query_store",
         "search_knowledge",
         "run_diagnosis",
         "regenerate_qr",
@@ -150,8 +149,6 @@ _INTENT_TOOL_SETS: dict[str, tuple[str, ...]] = {
     "MerchantReject": (
         "list_orders",
         "query_focus_bundle",
-        "query_order",
-        "query_voucher",
         "search_knowledge",
         "run_diagnosis",
         "contact_merchant",
@@ -169,8 +166,6 @@ _INTENT_TOOL_SETS: dict[str, tuple[str, ...]] = {
     "StoreUnavailable": (
         "list_orders",
         "query_focus_bundle",
-        "query_order",
-        "query_store",
         "search_knowledge",
         "run_diagnosis",
         "human_handoff",
@@ -178,8 +173,6 @@ _INTENT_TOOL_SETS: dict[str, tuple[str, ...]] = {
     "ReservationFailure": (
         "list_orders",
         "query_focus_bundle",
-        "query_order",
-        "query_store",
         "search_knowledge",
         "create_reservation",
         "run_diagnosis",
@@ -191,29 +184,28 @@ _INTENT_TOOL_SETS: dict[str, tuple[str, ...]] = {
 _DEFAULT_TOOLS: tuple[str, ...] = (
     "list_orders",
     "query_focus_bundle",
-    "query_order",
-    "query_voucher",
-    "query_store",
     "query_refund",
     "search_knowledge",
     "run_diagnosis",
     "human_handoff",
 )
 
+_ALWAYS_AVAILABLE = frozenset({"finish"})
 
-def tools_for_intent(intent: str | None) -> list[str]:
+
+def _base_tools(intent: str | None) -> list[str]:
     if not intent:
-        return list(_DEFAULT_TOOLS)
-    if intent in _INTENT_TOOL_SETS:
-        return list(_INTENT_TOOL_SETS[intent])
-    if intent.startswith("Query") or intent.startswith("Check"):
-        return list(_INTENT_TOOL_SETS.get("QueryOrder", _DEFAULT_TOOLS))
-    if "Complaint" in intent or intent in ("ServiceMismatch", "PriceDispute", "AppealRequest", "CompensationRequest"):
-        return list(
+        names = list(_DEFAULT_TOOLS)
+    elif intent in _INTENT_TOOL_SETS:
+        names = list(_INTENT_TOOL_SETS[intent])
+    elif intent.startswith("Query") or intent.startswith("Check"):
+        names = list(_INTENT_TOOL_SETS.get("QueryOrder", _DEFAULT_TOOLS))
+    elif "Complaint" in intent or intent in ("ServiceMismatch", "PriceDispute", "AppealRequest", "CompensationRequest"):
+        names = list(
             dict.fromkeys(
                 [
                     "list_orders",
-                    "query_order",
+                    "query_focus_bundle",
                     "search_knowledge",
                     "run_diagnosis",
                     "human_handoff",
@@ -221,11 +213,39 @@ def tools_for_intent(intent: str | None) -> list[str]:
                 ]
             )
         )
-    return list(_DEFAULT_TOOLS)
+    else:
+        names = list(_DEFAULT_TOOLS)
+
+    if settings.agent_hide_atomic_focus_reads and "query_focus_bundle" in names:
+        names = [n for n in names if n not in _ATOMIC_FOCUS_READS]
+    return names
 
 
-def tool_catalog_block(*, intent: str | None = None, compact: bool = False) -> str:
-    names = tools_for_intent(intent)
+def tools_for_intent(intent: str | None, *, exclude: set[str] | None = None) -> list[str]:
+    names = _base_tools(intent)
+    if exclude:
+        names = [n for n in names if n not in exclude]
+    return names
+
+
+def tools_for_continuation(intent: str | None, executed: set[str]) -> list[str]:
+    """续步只展示尚未执行过的工具（写操作/诊断/知识检索仍可重复）。"""
+    names = _base_tools(intent)
+    repeatable = frozenset({"search_knowledge", "run_diagnosis", "finish"}) | WRITE_TOOLS
+    return [n for n in names if n not in executed or n in repeatable]
+
+
+def tool_catalog_block(
+    *,
+    intent: str | None = None,
+    compact: bool = False,
+    exclude: set[str] | None = None,
+    executed: set[str] | None = None,
+) -> str:
+    if executed:
+        names = tools_for_continuation(intent, executed)
+    else:
+        names = tools_for_intent(intent, exclude=exclude)
     lines = []
     for name in names:
         meta = TOOL_CATALOG.get(name)

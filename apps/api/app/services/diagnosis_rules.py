@@ -97,7 +97,7 @@ def prompt_rules_block(route_intent: str | None, route_category: str | None) -> 
     if intent.startswith("Query") or intent in ("RefundRequest", "QueryRefund", "HumanTransfer"):
         return f"{_DUAL_REFERENCE_COMPACT}\n{_QUERY_DIAGNOSIS_RULES}"
 
-    return f"{_DUAL_REFERENCE_COMPACT}\n{DIAGNOSIS_TREE_RULES}"
+    return f"{_DUAL_REFERENCE_COMPACT}\n{_VOUCHER_DIAGNOSIS_RULES}\n{_QUERY_DIAGNOSIS_RULES}"
 
 
 def should_include_oral_guidance(route_intent: str | None, route_category: str | None) -> bool:

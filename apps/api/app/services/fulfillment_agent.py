@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import json
-import re
 import time
 from collections.abc import AsyncIterator, Callable
 from typing import Any
@@ -36,26 +34,12 @@ from app.services.thinking_narrative import (
     build_pre_reply_thought_lines,
     build_session_opening_lines,
 )
-from app.services.sessions import SessionStore
+from app.services.react_json import accumulate_stream_json, try_parse_react_json
 from app.services.tool_catalog import TOOL_CATALOG
 
 
 def _parse_json(raw: str) -> dict | None:
-    text = raw.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-    try:
-        data = json.loads(text)
-        return data if isinstance(data, dict) else None
-    except json.JSONDecodeError:
-        match = re.search(r"\{[\s\S]*\}", text)
-        if not match:
-            return None
-        try:
-            return json.loads(match.group())
-        except json.JSONDecodeError:
-            return None
+    return try_parse_react_json(raw)
 
 
 def _normalize_finish(data: dict) -> AgentFinishDecision:
@@ -183,18 +167,47 @@ class FulfillmentAgent:
         }
 
         full: list[str] = []
-        stream = (
-            self.polisher.polish_stream(
-                raw_text,
-                user_message=message,
-                mode=str(finish_dict.get("mode") or "reply"),
-            )
-            if tone_polished
-            else self.llm.stream_text(raw_text)
+        early_draft = (
+            settings.agent_early_draft_stream
+            and raw_text
+            and len(raw_text.strip()) >= settings.agent_draft_min_chars
         )
-        async for chunk in stream:
-            full.append(chunk)
-            yield "token", {"text": chunk}
+        if early_draft:
+            draft_text = raw_text.strip()
+            async for chunk in self.llm.stream_text(draft_text):
+                full.append(chunk)
+                yield "token", {"text": chunk, "phase": "draft"}
+            if tone_polished:
+                polish_started = False
+                async for chunk in self.polisher.polish_stream(
+                    draft_text,
+                    user_message=message,
+                    mode=str(finish_dict.get("mode") or "reply"),
+                ):
+                    if not polish_started:
+                        yield "reply_reset", {"phase": "polish"}
+                        polish_started = True
+                        full = []
+                    full.append(chunk)
+                    yield "token", {"text": chunk, "phase": "polish"}
+                if not polish_started:
+                    # 润色无输出：保留已展示的 draft，避免闪屏后空白
+                    full = list(draft_text)
+            else:
+                full = list(draft_text)
+        else:
+            stream = (
+                self.polisher.polish_stream(
+                    raw_text,
+                    user_message=message,
+                    mode=str(finish_dict.get("mode") or "reply"),
+                )
+                if tone_polished
+                else self.llm.stream_text(raw_text)
+            )
+            async for chunk in stream:
+                full.append(chunk)
+                yield "token", {"text": chunk}
 
         agent_result.finish.draft_message = "".join(full)
         yield "result", agent_result
@@ -235,6 +248,17 @@ class FulfillmentAgent:
                 yield kind, payload
             return
 
+        await self._prefetch_focus_bundle(db, state, on_step)
+        if state.prefetch_done and state.trace:
+            prefetch = state.trace[0]
+            yield "react_step", self._react_step_payload(
+                prefetch,
+                state,
+                tool_latency_ms=0,
+                step_latency_ms=0,
+                prefetch=True,
+            )
+
         finish: AgentFinishDecision | None = None
         for step_idx in range(1, settings.agent_max_steps + 1):
             step_started = time.perf_counter()
@@ -242,20 +266,17 @@ class FulfillmentAgent:
                 yield "thinking", {"line": "进入分步推理：先拿系统里的真实数据，再决定怎么帮您"}
             system = build_react_system_prompt(state, history, step_idx=step_idx)
             user_block = f"用户最新：{state.message}\n\n请输出下一步 JSON。"
-            llm_started = time.perf_counter()
-            raw = await self.llm.complete_with_history(
+            raw, data, llm_latency_ms, parse_ms = await self._react_llm_step(
                 system,
                 history if step_idx == 1 else [],
                 user_block,
-                temperature=settings.agent_react_temperature,
-                max_tokens=settings.agent_react_max_tokens,
             )
-            llm_latency_ms = int((time.perf_counter() - llm_started) * 1000)
             if not raw:
                 finish = self._fallback_finish(state, "LLM 无响应，进入澄清")
                 break
 
-            data = _parse_json(raw)
+            if data is None:
+                data = _parse_json(raw)
             if not data:
                 finish = self._fallback_finish(state, "JSON 解析失败")
                 break
@@ -273,7 +294,11 @@ class FulfillmentAgent:
                 if on_step:
                     on_step(trace, state)
                 yield "react_step", self._react_step_payload(
-                    trace, state, llm_latency_ms=llm_latency_ms, step_latency_ms=int((time.perf_counter() - step_started) * 1000)
+                    trace,
+                    state,
+                    llm_latency_ms=llm_latency_ms,
+                    json_parse_ms=parse_ms,
+                    step_latency_ms=int((time.perf_counter() - step_started) * 1000),
                 )
                 for kind, payload in _emit_thinking(
                     build_finish_thought_lines(
@@ -298,7 +323,11 @@ class FulfillmentAgent:
                 if on_step:
                     on_step(trace, state)
                 yield "react_step", self._react_step_payload(
-                    trace, state, llm_latency_ms=llm_latency_ms, step_latency_ms=int((time.perf_counter() - step_started) * 1000)
+                    trace,
+                    state,
+                    llm_latency_ms=llm_latency_ms,
+                    json_parse_ms=parse_ms,
+                    step_latency_ms=int((time.perf_counter() - step_started) * 1000),
                 )
                 continue
 
@@ -314,6 +343,7 @@ class FulfillmentAgent:
                 yield kind, payload
 
             result = await self.tool_executor.execute(db, state, action, action_input)
+            state.executed_tools.add(action)
             state.tool_calls.append({"name": action, "input": action_input, "result": result})
             trace = AgentTraceStep(step_idx, thought, action, action_input, observation=result)
             state.trace.append(trace)
@@ -324,6 +354,7 @@ class FulfillmentAgent:
                 trace,
                 state,
                 llm_latency_ms=llm_latency_ms,
+                json_parse_ms=parse_ms,
                 tool_latency_ms=tool_latency_ms,
                 step_latency_ms=int((time.perf_counter() - step_started) * 1000),
             )
@@ -351,6 +382,83 @@ class FulfillmentAgent:
             knowledge_titles=[a.title for a in state.knowledge_articles],
             pending_confirmations=list(state.pending_confirmations),
         )
+
+    async def _react_llm_step(
+        self,
+        system: str,
+        history: list[dict],
+        user_block: str,
+    ) -> tuple[str | None, dict | None, int, int | None]:
+        """ReAct 单步 LLM：可选流式 JSON 解析。"""
+        started = time.perf_counter()
+        if settings.agent_react_stream_json:
+            stream = self.llm.stream_reply(
+                system,
+                history,
+                user_block,
+                temperature=settings.agent_react_temperature,
+                max_tokens=settings.agent_react_max_tokens,
+            )
+            raw, parsed, stream_parse_ms = await accumulate_stream_json(stream)
+            llm_ms = int((time.perf_counter() - started) * 1000)
+            return (raw or None), parsed, llm_ms, stream_parse_ms
+
+        raw = await self.llm.complete_with_history(
+            system,
+            history,
+            user_block,
+            temperature=settings.agent_react_temperature,
+            max_tokens=settings.agent_react_max_tokens,
+        )
+        llm_ms = int((time.perf_counter() - started) * 1000)
+        return raw, _parse_json(raw) if raw else None, llm_ms, None
+
+    async def _prefetch_focus_bundle(
+        self,
+        db: AsyncSession,
+        state: AgentState,
+        on_step: Callable | None,
+    ) -> None:
+        """工程层预取：有聚焦订单且意图可办时，ReAct 前先并行拉 order+voucher+store。"""
+        if not settings.agent_prefetch_focus_bundle or state.prefetch_done:
+            return
+        intent = state.intent_result
+        if intent.route_category in ("chitchat", "unconfigured"):
+            return
+        orders = state.service_context.get("orders") or []
+        if len(orders) > 1 and not state.focus_order_id:
+            return
+        if len(orders) == 1 and not state.focus_order_id:
+            state.focus_order_id = str(orders[0]["id"])
+        if not state.focus_order_id:
+            return
+
+        result = await self.tool_executor.execute(
+            db,
+            state,
+            "query_focus_bundle",
+            {"order_id": state.focus_order_id},
+        )
+        state.prefetch_done = True
+        state.executed_tools.add("query_focus_bundle")
+        state.tool_calls.append(
+            {
+                "name": "query_focus_bundle",
+                "input": {"order_id": state.focus_order_id},
+                "result": result,
+                "prefetch": True,
+            }
+        )
+        trace = AgentTraceStep(
+            0,
+            "预取聚焦订单/券/门店（并行）",
+            "query_focus_bundle",
+            {"order_id": state.focus_order_id, "prefetch": True},
+            observation=result,
+        )
+        state.trace.append(trace)
+        if on_step:
+            on_step(trace, state)
 
     async def _mock_react_stream(
         self,
@@ -387,7 +495,7 @@ class FulfillmentAgent:
         yield "complete", result
 
     @staticmethod
-    def _react_step_payload(trace: AgentTraceStep, state: AgentState, **timing: int) -> dict:
+    def _react_step_payload(trace: AgentTraceStep, state: AgentState, **timing: int | bool) -> dict:
         payload = {
             "step": trace.to_dict(),
             "focus_order_id": state.focus_order_id,
@@ -395,8 +503,11 @@ class FulfillmentAgent:
             "diagnosis_script_count": len(state.diagnosis_advisories),
             "pending_confirmations": [p.to_dict() for p in state.pending_confirmations],
         }
-        if timing:
-            payload["timing_ms"] = timing
+        timing_ms = {k: v for k, v in timing.items() if isinstance(v, int)}
+        if timing.get("prefetch"):
+            payload["prefetch"] = True
+        if timing_ms:
+            payload["timing_ms"] = timing_ms
         return payload
 
     async def _mock_react(
@@ -452,6 +563,7 @@ class FulfillmentAgent:
 
         step_n = 1
         list_obs = await self.tool_executor.execute(db, state, "list_orders", {})
+        state.executed_tools.add("list_orders")
         step = AgentTraceStep(step_n, "确认订单列表", "list_orders", {}, observation=list_obs)
         state.trace.append(step)
         state.tool_calls.append({"name": "list_orders", "input": {}, "result": list_obs})

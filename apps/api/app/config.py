@@ -79,6 +79,26 @@ class Settings(BaseSettings):
         default=False,
         validation_alias=AliasChoices("AGENT_PARALLEL_INTENT_KNOWLEDGE"),
     )
+    agent_early_draft_stream: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("AGENT_EARLY_DRAFT_STREAM"),
+    )
+    agent_prefetch_focus_bundle: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("AGENT_PREFETCH_FOCUS_BUNDLE"),
+    )
+    agent_react_stream_json: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("AGENT_REACT_STREAM_JSON"),
+    )
+    agent_coalesce_focus_reads: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("AGENT_COALESCE_FOCUS_READS"),
+    )
+    agent_hide_atomic_focus_reads: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("AGENT_HIDE_ATOMIC_FOCUS_READS"),
+    )
 
     error_recovery_use_llm: bool = Field(default=True, validation_alias=AliasChoices("ERROR_RECOVERY_USE_LLM"))
     error_recovery_max_tokens: int = Field(default=320, validation_alias=AliasChoices("ERROR_RECOVERY_MAX_TOKENS"))

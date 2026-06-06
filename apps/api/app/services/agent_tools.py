@@ -12,8 +12,11 @@ from app.diagnosis import DiagnosisEngine
 from app.repositories.life_service import KnowledgeRepository
 from app.services.agent_state import AgentState, PendingWriteAction
 from app.services.error_recovery import tool_error_payload
+from app.config import settings
 from app.services.tool_catalog import TOOL_CATALOG, TOOL_TO_ACTION_ID, WRITE_ACTION_TITLES, WRITE_TOOLS
 from app.services.tools import LifeServiceTools
+
+_ATOMIC_FOCUS_READS = frozenset({"query_order", "query_voucher", "query_store"})
 
 
 def _compact(value: Any, limit: int = 1200) -> Any:
@@ -70,6 +73,35 @@ class AgentToolExecutor:
             return {"ok": False, "error": f"未知工具 {tool_name}"}
 
         args = action_input or {}
+
+        if (
+            settings.agent_coalesce_focus_reads
+            and tool_name in _ATOMIC_FOCUS_READS
+            and (args.get("order_id") or state.focus_order_id)
+        ):
+            cached = state.focus_bundle_cache
+            if cached:
+                if tool_name == "query_order":
+                    return _compact({"ok": True, **(cached.get("order") or {}), "from_cache": True})
+                if tool_name == "query_voucher":
+                    return _compact({"ok": True, **(cached.get("voucher") or {}), "from_cache": True})
+                if tool_name == "query_store":
+                    store_payload = cached.get("store") or {}
+                    return _compact({"ok": store_payload.get("found", False), **store_payload, "from_cache": True})
+            coerced = await self._execute_inner(
+                db,
+                state,
+                "query_focus_bundle",
+                {"order_id": str(args.get("order_id") or state.focus_order_id)},
+            )
+            if tool_name == "query_order":
+                return _compact({"ok": True, **(coerced.get("order") or {}), "coalesced": True})
+            if tool_name == "query_voucher":
+                return _compact({"ok": True, **(coerced.get("voucher") or {}), "coalesced": True})
+            if tool_name == "query_store":
+                store_payload = coerced.get("store") or {}
+                return _compact({"ok": store_payload.get("found", False), **store_payload, "coalesced": True})
+
         user_id = state.user_id
         session_id = state.session_id
 
@@ -131,15 +163,17 @@ class AgentToolExecutor:
             )
             if order_res.get("found") and order_res.get("order"):
                 state.focus_order_id = str(order_res["order"].get("id") or order_id)
-            return _compact(
-                {
-                    "ok": True,
-                    "parallel": True,
-                    "order": order_res,
-                    "voucher": voucher_res,
-                    "store": store_res,
-                }
-            )
+            bundle = {
+                "ok": True,
+                "parallel": True,
+                "order": order_res,
+                "voucher": voucher_res,
+                "store": store_res,
+            }
+            state.focus_bundle_cache = bundle
+            state.executed_tools.update(_ATOMIC_FOCUS_READS)
+            state.executed_tools.add("query_focus_bundle")
+            return _compact(bundle)
 
         if tool_name == "query_coupon":
             result = await self.tools.query_coupon(db, user_id)

@@ -106,10 +106,19 @@ class ChatOrchestrator:
                     focus_order_id = payload.get("focus_order_id") or focus_order_id
                     action = trace_step.get("action", "?")
                     thought = str(trace_step.get("thought") or "")[:80]
-                    step("agent_react", f"#{trace_step.get('step', '?')} {action}: {thought}")
+                    timing = payload.get("timing_ms") or {}
+                    timing_note = ""
+                    if timing:
+                        parts = [f"{k}={v}ms" for k, v in timing.items()]
+                        timing_note = f" ({', '.join(parts)})"
+                    label = "agent_prefetch" if payload.get("prefetch") else "agent_react"
+                    step(label, f"#{trace_step.get('step', '?')} {action}: {thought}{timing_note}")
+                    yield "react_step", payload
                     yield "pipeline", pipeline_payload()
                 elif event == "thinking":
                     yield "thinking", payload
+                elif event == "reply_reset":
+                    yield "reply_reset", payload
                 elif event == "agent":
                     intent = payload.get("intent", intent)
                     intent_meta = payload.get("intent_meta") or {}

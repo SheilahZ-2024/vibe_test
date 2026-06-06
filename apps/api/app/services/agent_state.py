@@ -116,3 +116,6 @@ class AgentState:
     tool_calls: list[dict] = field(default_factory=list)
     diagnosis_advisories: list[dict] = field(default_factory=list)
     pending_confirmations: list[PendingWriteAction] = field(default_factory=list)
+    focus_bundle_cache: dict[str, Any] | None = None
+    executed_tools: set[str] = field(default_factory=set)
+    prefetch_done: bool = False

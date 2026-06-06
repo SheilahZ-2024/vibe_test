@@ -300,6 +300,13 @@ export default function App() {
               return [...rest, { id: assistantId, role: "assistant", content: reply }];
             });
           },
+          onReplyReset: () => {
+            reply = "";
+            setMessages((items) => {
+              const rest = items.filter((item) => item.id !== assistantId);
+              return [...rest, { id: assistantId, role: "assistant", content: "" }];
+            });
+          },
           onDone: (data) => {
             setStreamPhase("idle");
             setThinkingLines([]);
