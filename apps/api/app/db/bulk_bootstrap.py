@@ -114,7 +114,7 @@ async def ensure_bulk_seed(db: AsyncSession) -> None:
         return
 
     users = int(await db.scalar(select(func.count()).select_from(User)) or 0)
-    if users >= BULK_SEED_MIN_USERS:
+    if users > 0:
         await _truncate_bulk_data(db)
 
     script = path.read_text(encoding="utf-8")
