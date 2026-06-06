@@ -1,0 +1,16 @@
+# 生产环境叠加配置：仅对外暴露 Web 端口，数据库/Redis/API 不映射到公网
+# 用法：docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+
+services:
+  postgres:
+    ports: []
+
+  redis:
+    ports: []
+
+  api:
+    ports: []
+
+  web:
+    ports:
+      - "${WEB_PORT:-5173}:80"

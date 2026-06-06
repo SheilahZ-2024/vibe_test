@@ -205,6 +205,7 @@ cd apps\api
 
 - [产品说明](./docs/PRODUCT.md)
 - [系统架构](./docs/ARCHITECTURE.md)
+- [阿里云部署](./docs/DEPLOY_ALIYUN.md)
 
 ## GitHub
 
