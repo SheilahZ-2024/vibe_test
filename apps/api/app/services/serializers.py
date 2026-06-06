@@ -14,8 +14,9 @@ def json_value(value: Any) -> Any:
 def model_dict(obj: Any, fields: list[str]) -> dict:
     out: dict[str, Any] = {}
     for field in fields:
-        attr = field
-        if not hasattr(obj, attr) and field == "metadata" and hasattr(obj, "metadata_"):
-            attr = "metadata_"
-        out[field] = json_value(getattr(obj, attr))
+        if field == "metadata" and hasattr(obj, "metadata_"):
+            value = getattr(obj, "metadata_")
+        else:
+            value = getattr(obj, field)
+        out[field] = json_value(value)
     return out

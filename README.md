@@ -20,9 +20,30 @@
 ```text
 apps/web          React + Vite + Tailwind，移动端履约服务管家体验
 apps/api          FastAPI，SSE 流式对话、业务工具、LLM 编排
+apps/api/app/diagnosis   SDS v1 诊断引擎（Case 注册表 / 诊断树 / 动作矩阵）
 deploy/init-db    PostgreSQL 领域 schema 与生活服务种子数据
 docker-compose    postgres + redis + api + web(nginx)
 ```
+
+### SDS v1 诊断链路
+
+遵循《Service Diagnosis System v1》规范，每轮对话严格走：
+
+```text
+Intent识别 → 上下文获取 → 诊断树执行 → Case生成 → 工具调用 → Prompt注入 → LLM解释
+```
+
+- **Case 体系**：73 个注册 Case（IC 10 + PC 15 + FC 20 + AC 10 + CC 15 + 系统 3）
+- **代码入口**：`apps/api/app/diagnosis/`（`case_specs` / `registry` / `engine` / `matrices` / `storybook`）
+- **Storybook**：SB-001 ~ SB-018 口语表达库，见 `storybook.py`
+- **种子数据**：`deploy/init-db/04-sds-storybook-seed.sql`、`05-sds-full-seed.sql`
+
+### 前端体验（会话为主）
+
+- 主界面以**会话服务**为全屏主体；订单摘要与履约进度嵌入对话区域顶部
+- 输入框右侧 **+** 可打开：服务进度、历史订单、操作记录、授权设置（半屏 BottomSheet）
+- 流式回复前展示**自然语言思考过程**（不暴露 Case ID、Intent 等术语给用户）
+- 诊断完成后展示「您可以这样继续」动作 chips
 
 ## 快速开始
 
@@ -72,21 +93,40 @@ docker compose up --build
 | API 文档 | http://localhost:8000/docs |
 | 健康检查 | http://localhost:8000/health |
 
-无 `OPENAI_API_KEY` 时，系统自动使用内置 Mock 模型，仍可完整演示业务链路。
+无 `LLM_API_KEY` 时，系统自动使用内置 Mock 模型，仍可完整演示业务链路。
 
 ### 接入豆包（火山方舟）
 
 在 `.env` 中配置：
 
 ```env
-OPENAI_API_KEY=你的方舟API密钥
-OPENAI_BASE_URL=https://ark.cn-beijing.volces.com/api/v3
-OPENAI_MODEL=doubao-seed-1-8-251228
-OPENAI_TEMPERATURE=0.3
-OPENAI_MAX_TOKENS=1200
+LLM_API_KEY=你的方舟API密钥
+LLM_BASE_URL=https://ark.cn-beijing.volces.com/api/v3
+LLM_MODEL=doubao-seed-1-8-251228
+LLM_TEMPERATURE=0.3
+LLM_MAX_TOKENS=1200
 ```
 
-注意：`OPENAI_MODEL` 填写豆包官网模型 ID（如 `doubao-seed-1-8-251228`）或方舟推理接入点 ID（`ep-` 开头）。
+注意：`LLM_MODEL` 填写豆包官网模型 ID（如 `doubao-seed-1-8-251228`）或方舟推理接入点 ID（`ep-` 开头）。
+
+### 意图识别（轻量 LLM + 置信度阈值）
+
+对话链路会先做一次**轻量意图分类**（非主回复 LLM），再决定是否进入工具链：
+
+```env
+INTENT_CONFIDENCE_THRESHOLD=0.65   # 达到阈值才路由到业务意图
+INTENT_USE_LLM=true                # 有 API Key 时用 LLM；否则关键词兜底
+INTENT_LLM_TEMPERATURE=0.1
+INTENT_LLM_MAX_TOKENS=256
+```
+
+| 路由结果 | 行为 |
+|----------|------|
+| 置信度 ≥ 阈值 + 业务意图 | 调用对应工具链（查单/诊断/退款等） |
+| 置信度 < 阈值 | `clarify`：跳过工具，模型先澄清/探明需求 |
+| `chitchat` | 简短闲聊后引导回履约话题 |
+
+SSE `pipeline` / `done` 事件会附带 `intent_meta`（原始意图、置信度、来源、备选意图）。
 
 连通性测试：
 
@@ -112,7 +152,30 @@ cd C:\Users\15924\Projects\smart-assistant\apps\api
 | GET | `/health/llm/ping` | 模型连通性测试 |
 | GET | `/api/v1/users/{user_id}/fulfillment-events` | 履约事件列表 |
 | GET | `/api/v1/users/{user_id}/operation-logs` | 操作记录列表 |
+| GET | `/api/v1/diagnosis/cases` | Case 列表 |
+| GET | `/api/v1/diagnosis/cases/{case_id}` | Case 详情与推荐动作 |
+| GET | `/api/v1/diagnosis/stats` | Case 统计 |
 | POST | `/api/v1/workflow/actions` | 执行工作流处置动作 |
+
+## Storybook 测试话术
+
+| 用户说法 | 预期 Case |
+|----------|-----------|
+| 扫不出来 | FC-008 |
+| 老板不给用 | FC-006 |
+| 店关门了 | FC-001 |
+| 我要退款 | AC-001 / AC-002 |
+| 吃坏肚子 | CC-008（P0） |
+| 那个有点问题 | CLARIFY |
+| 付了钱没券 | PC-001 |
+
+批测（诊断引擎 + 可选 API）：
+
+```powershell
+cd apps\api
+.\.venv\Scripts\python.exe scripts\batch_storybook_test.py
+.\.venv\Scripts\python.exe scripts\batch_storybook_test.py --api http://localhost:8000
+```
 
 ## 示例问题
 

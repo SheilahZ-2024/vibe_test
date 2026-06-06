@@ -67,9 +67,16 @@ export interface WorkflowSolution {
 }
 
 export interface WorkflowDiagnosis {
+  intent?: string;
+  case_id?: string;
+  case_name?: string;
+  problem_space?: string;
+  user_goal?: string;
+  escalation?: string;
   issue?: string;
   root_cause?: string;
   confidence?: string;
-  diagnosis?: Array<{ check: string; status: string; detail: string }>;
+  triggered_rules?: string[];
+  diagnosis?: Array<{ step?: number; check: string; status: string; detail: string; case_id?: string }>;
   solution?: WorkflowSolution[];
 }

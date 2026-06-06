@@ -15,10 +15,10 @@ async def main():
     ping = await svc.ping()
     print(json.dumps({
         'mode': svc.mode,
-        'model': settings.openai_model,
-        'base_url': settings.openai_base_url,
-        'temperature': settings.openai_temperature,
-        'max_tokens': settings.openai_max_tokens,
+        'model': settings.llm_model,
+        'base_url': settings.llm_base_url,
+        'temperature': settings.llm_temperature,
+        'max_tokens': settings.llm_max_tokens,
         'ping': ping,
     }, ensure_ascii=False, indent=2))
 

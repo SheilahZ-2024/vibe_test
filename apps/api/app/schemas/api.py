@@ -27,6 +27,8 @@ class ChatResponse(BaseModel):
     pipeline: dict
     service_cards: list[dict] = Field(default_factory=list)
     tool_calls: list[dict] = Field(default_factory=list)
+    workflow: dict | None = None
+    case: dict | None = None
 
 
 class SessionCreateResponse(BaseModel):

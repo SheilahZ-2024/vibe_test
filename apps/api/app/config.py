@@ -1,37 +1,64 @@
 from pathlib import Path
 
-from pydantic import field_validator
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-ENV_FILES = [PROJECT_ROOT / ".env", Path(".env")]
+
+def _discover_env_files() -> list[str]:
+    here = Path(__file__).resolve()
+    candidates: list[Path] = [Path(".env")]
+    for depth in (3, 2, 1):
+        if len(here.parents) > depth:
+            candidates.append(here.parents[depth] / ".env")
+    seen: set[str] = set()
+    files: list[str] = []
+    for path in candidates:
+        key = str(path)
+        if path.exists() and key not in seen:
+            seen.add(key)
+            files.append(key)
+    return files
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=[str(path) for path in ENV_FILES if path.exists()],
+        env_file=_discover_env_files(),
         extra="ignore",
     )
 
     database_url: str = "postgresql+asyncpg://smart_assistant:change_me_in_production@localhost:5432/smart_assistant"
     redis_url: str = "redis://localhost:6379/0"
 
-    openai_api_key: str = ""
-    openai_base_url: str = "https://api.openai.com/v1"
-    openai_model: str = "gpt-4o-mini"
-    openai_temperature: float = 0.3
-    openai_top_p: float = 0.8
-    openai_max_tokens: int = 1200
-    openai_timeout_seconds: float = 60.0
-    openai_fallback_to_mock: bool = True
+    llm_api_key: str = Field(default="", validation_alias=AliasChoices("LLM_API_KEY", "OPENAI_API_KEY"))
+    llm_base_url: str = Field(
+        default="https://api.openai.com/v1",
+        validation_alias=AliasChoices("LLM_BASE_URL", "OPENAI_BASE_URL"),
+    )
+    llm_model: str = Field(default="gpt-4o-mini", validation_alias=AliasChoices("LLM_MODEL", "OPENAI_MODEL"))
+    llm_temperature: float = Field(default=0.3, validation_alias=AliasChoices("LLM_TEMPERATURE", "OPENAI_TEMPERATURE"))
+    llm_top_p: float = Field(default=0.8, validation_alias=AliasChoices("LLM_TOP_P", "OPENAI_TOP_P"))
+    llm_max_tokens: int = Field(default=1200, validation_alias=AliasChoices("LLM_MAX_TOKENS", "OPENAI_MAX_TOKENS"))
+    llm_timeout_seconds: float = Field(
+        default=60.0,
+        validation_alias=AliasChoices("LLM_TIMEOUT_SECONDS", "OPENAI_TIMEOUT_SECONDS"),
+    )
+    llm_fallback_to_mock: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("LLM_FALLBACK_TO_MOCK", "OPENAI_FALLBACK_TO_MOCK"),
+    )
+
+    intent_confidence_threshold: float = Field(default=0.65, validation_alias=AliasChoices("INTENT_CONFIDENCE_THRESHOLD"))
+    intent_use_llm: bool = Field(default=True, validation_alias=AliasChoices("INTENT_USE_LLM"))
+    intent_llm_temperature: float = Field(default=0.1, validation_alias=AliasChoices("INTENT_LLM_TEMPERATURE"))
+    intent_llm_max_tokens: int = Field(default=256, validation_alias=AliasChoices("INTENT_LLM_MAX_TOKENS"))
 
     api_secret_key: str = "dev-secret-change-me"
     cors_origins: str = "http://localhost:5173,http://localhost:3000"
 
     @field_validator(
-        "openai_api_key",
-        "openai_base_url",
-        "openai_model",
+        "llm_api_key",
+        "llm_base_url",
+        "llm_model",
         "database_url",
         "redis_url",
         mode="before",

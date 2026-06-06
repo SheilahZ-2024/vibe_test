@@ -57,6 +57,8 @@ async def chat_stream(
         try:
             async for event, payload in orchestrator.run_stream(db, store, body):
                 yield {"event": event, "data": json.dumps(payload, ensure_ascii=False)}
+        except Exception as exc:
+            yield {"event": "error", "data": json.dumps({"message": str(exc)}, ensure_ascii=False)}
         finally:
             await redis.aclose()
 

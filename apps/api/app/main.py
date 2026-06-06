@@ -7,8 +7,9 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.db.session import get_db
-from app.routers import chat, life_service
+from app.db.migrate import apply_migrations
+from app.db.session import SessionLocal, get_db
+from app.routers import chat, diagnosis, life_service
 from app.schemas.api import HealthOut, LLMSettingsOut
 from app.services.llm import LLMService
 
@@ -17,6 +18,8 @@ llm = LLMService()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    async with SessionLocal() as db:
+        await apply_migrations(db)
     yield
 
 
@@ -37,6 +40,7 @@ app.add_middleware(
 
 app.include_router(chat.router)
 app.include_router(life_service.router)
+app.include_router(diagnosis.router)
 
 
 @app.get("/health", response_model=HealthOut)
@@ -57,7 +61,7 @@ async def health(db: AsyncSession = Depends(get_db)):
     finally:
         await redis.aclose()
 
-    llm_ping = await llm.ping() if not llm.use_mock else {"ok": False, "mode": "mock"}
+    llm_ping = {"ok": None, "mode": llm.mode}
 
     return HealthOut(
         status="ok" if postgres_ok and redis_ok else "degraded",
@@ -65,7 +69,7 @@ async def health(db: AsyncSession = Depends(get_db)):
         redis="up" if redis_ok else "down",
         llm_mode=llm.mode,
         llm_ok=llm_ping.get("ok"),
-        llm_model=settings.openai_model,
+        llm_model=settings.llm_model,
     )
 
 
@@ -74,13 +78,13 @@ async def health_llm():
     ping = await llm.ping()
     return LLMSettingsOut(
         mode=ping.get("mode", llm.mode),
-        model=settings.openai_model,
-        base_url=settings.openai_base_url,
-        temperature=settings.openai_temperature,
-        top_p=settings.openai_top_p,
-        max_tokens=settings.openai_max_tokens,
-        timeout_seconds=settings.openai_timeout_seconds,
-        fallback_to_mock=settings.openai_fallback_to_mock,
+        model=settings.llm_model,
+        base_url=settings.llm_base_url,
+        temperature=settings.llm_temperature,
+        top_p=settings.llm_top_p,
+        max_tokens=settings.llm_max_tokens,
+        timeout_seconds=settings.llm_timeout_seconds,
+        fallback_to_mock=settings.llm_fallback_to_mock,
     )
 
 

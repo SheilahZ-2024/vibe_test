@@ -13,8 +13,9 @@ from app.repositories.life_service import (
     TicketRepository,
     VoucherRepository,
 )
+from app.diagnosis import DiagnosisContext, DiagnosisEngine
+from app.diagnosis.types import CaseDiagnosisResult
 from app.services.serializers import model_dict
-from app.services.workflows import ServiceWorkflowResult, analyze_voucher_verification_failure
 
 
 class LifeServiceTools:
@@ -26,6 +27,149 @@ class LifeServiceTools:
         self.stores = StoreRepository()
         self.tickets = TicketRepository()
         self.operation_logs = OperationLogRepository()
+        self.diagnosis_engine = DiagnosisEngine()
+
+    async def build_diagnosis_context(
+        self,
+        db: AsyncSession,
+        user_id: str,
+        message: str,
+        service_context: dict,
+    ) -> DiagnosisContext:
+        order_id = "order_hotpot_8821"
+        voucher_id = "voucher_hotpot_8821"
+        if service_context.get("orders"):
+            order_id = str(service_context["orders"][0].get("id", order_id))
+        if service_context.get("vouchers"):
+            voucher_id = str(service_context["vouchers"][0].get("id", voucher_id))
+
+        order_payload = await self.query_order(db, user_id, order_id)
+        voucher_payload = await self.query_voucher(db, user_id, voucher_id)
+        store_payload = await self.query_store(db, user_id, order_id)
+        coupon_payload = await self.query_coupon(db, user_id)
+        refund_list = service_context.get("refunds") or []
+
+        voucher = next((v for v in voucher_payload.get("vouchers", []) if v["id"] == voucher_id), None)
+        if not voucher and voucher_payload.get("vouchers"):
+            voucher = voucher_payload["vouchers"][0]
+
+        order = order_payload.get("order")
+        store = store_payload.get("store")
+        if store and order:
+            store = {**store, "id": order.get("store_id")}
+
+        return DiagnosisContext(
+            message=message,
+            user=service_context.get("user"),
+            order=order,
+            voucher=voucher,
+            store=store,
+            coupon=coupon_payload.get("coupon"),
+            refund=refund_list[0] if refund_list else None,
+            orders=service_context.get("orders") or [],
+            vouchers=voucher_payload.get("vouchers") or [],
+        )
+
+    async def run_diagnosis_tools(
+        self,
+        db: AsyncSession,
+        session_id: str,
+        user_id: str,
+        intent: str,
+        diagnosis: CaseDiagnosisResult,
+        dx_ctx: DiagnosisContext,
+    ) -> list[dict]:
+        """按 Case 前缀与 Intent 执行查询/写操作工具。"""
+        tool_calls: list[dict] = []
+        order_id = (dx_ctx.order or {}).get("id")
+        voucher_id = (dx_ctx.voucher or {}).get("id")
+        cid = diagnosis.case_id
+
+        prefixes_need_order = ("IC-", "PC-", "AC-", "FC-", "CC-012")
+        if intent in ("QueryOrder", "RefundRequest", "QueryRefund", "CheckRefundEligibility") or cid.startswith(prefixes_need_order):
+            tool_calls.append({"name": "query_order", "result": await self.query_order(db, user_id, order_id)})
+
+        if intent in ("QueryVoucher", "VoucherUnavailable", "CheckVoucherAvailability") or cid.startswith(("IC-00", "PC-0")):
+            tool_calls.append({"name": "query_voucher", "result": await self.query_voucher(db, user_id, voucher_id)})
+
+        if intent in ("QueryStore", "StoreUnavailable") or cid.startswith(("IC-008", "FC-00", "FC-01", "FC-02", "FC-003", "FC-004", "FC-005", "FC-019")):
+            tool_calls.append({"name": "query_store", "result": await self.query_store(db, user_id, order_id)})
+
+        if intent == "QueryCoupon" or cid.startswith(("IC-007", "PC-012", "PC-013", "PC-014")):
+            tool_calls.append({"name": "query_coupon", "result": await self.query_coupon(db, user_id)})
+
+        if intent in ("RefundRequest", "QueryRefund", "CompensationRequest", "AppealRequest") or cid.startswith("AC-"):
+            tool_calls.append({"name": "query_refund", "result": await self.query_refund(db, user_id, order_id)})
+
+        if cid in ("AC-008",) or intent == "QueryTicket":
+            tool_calls.append({"name": "query_ticket", "result": await self.query_ticket(db, user_id, session_id)})
+
+        tool_calls.append({"name": "run_diagnosis", "result": diagnosis.to_dict()})
+
+        if intent == "HumanTransfer":
+            ticket = await self.transfer_to_human(db, session_id, user_id, order_id, {"reason": dx_ctx.message, "case_id": cid})
+            tool_calls.append({"name": "transfer_to_human", "result": {"ticket_id": ticket.id, "priority": ticket.priority}})
+
+        if diagnosis.escalation == "P0" and intent not in ("HumanTransfer",):
+            ticket = await self.create_service_ticket(db, session_id, user_id, order_id, "escalation_p0", {"case_id": cid, "escalation": "P0"})
+            tool_calls.append({"name": "create_ticket", "result": {"ticket_id": ticket.id, "priority": "high"}})
+
+        return tool_calls
+
+    async def query_ticket(self, db: AsyncSession, user_id: str, session_id: str | None = None) -> dict:
+        from sqlalchemy import select
+        from app.models.entities import ServiceTicket
+
+        q = select(ServiceTicket).where(ServiceTicket.user_id == user_id).order_by(ServiceTicket.created_at.desc()).limit(5)
+        rows = list((await db.execute(q)).scalars().all())
+        return {
+            "count": len(rows),
+            "tickets": [
+                {"id": t.id, "type": t.type, "status": t.status, "priority": t.priority, "order_id": t.order_id}
+                for t in rows
+            ],
+        }
+
+    async def create_complaint(
+        self,
+        db: AsyncSession,
+        session_id: str,
+        user_id: str,
+        order_id: str | None,
+        complaint_type: str,
+        detail: str,
+    ) -> ServiceTicket:
+        priority = "high" if complaint_type in ("food_safety", "personal_safety", "force_consumption") else "normal"
+        ticket = ServiceTicket(
+            id=f"CMP-{uuid.uuid4().hex[:8].upper()}",
+            session_id=session_id,
+            user_id=user_id,
+            order_id=order_id,
+            type="complaint",
+            status="open",
+            priority=priority,
+            payload={"complaint_type": complaint_type, "detail": detail},
+        )
+        return await self.tickets.create(db, ticket)
+
+    async def apply_compensation(
+        self,
+        db: AsyncSession,
+        session_id: str,
+        user_id: str,
+        order_id: str | None,
+        reason: str,
+        amount: float | None = None,
+    ) -> dict:
+        ticket = await self.create_service_ticket(
+            db,
+            session_id,
+            user_id,
+            order_id,
+            "compensation_review",
+            {"reason": reason, "requested_amount": amount, "status": "pending_review"},
+        )
+        return {"ok": True, "ticket_id": ticket.id, "status": "pending_review", "message": "补偿申请已提交审核"}
 
     async def query_order(self, db: AsyncSession, user_id: str, order_id: str | None = None) -> dict:
         order = await self.orders.get(db, order_id) if order_id else None
@@ -123,24 +267,18 @@ class LifeServiceTools:
         if not voucher and voucher_payload.get("vouchers"):
             voucher = voucher_payload["vouchers"][0]
 
-        workflow: ServiceWorkflowResult = analyze_voucher_verification_failure(
-            voucher,
-            order_payload.get("order"),
-            store_payload.get("store"),
+        dx_ctx = DiagnosisContext(
+            message="核销失败",
+            order=order_payload.get("order"),
+            voucher=voucher,
+            store=store_payload.get("store"),
         )
-        return {
-            "issue": workflow.issue,
-            "root_cause": workflow.root_cause,
-            "confidence": workflow.confidence,
-            "diagnosis": [
-                {"check": d.check, "status": d.status, "detail": d.detail, "root_cause": d.root_cause}
-                for d in workflow.diagnosis
-            ],
-            "solution": [{"action_id": s.action_id, "title": s.title, "description": s.description, "tool": s.tool_name} for s in workflow.solutions],
-            "order": order_payload.get("order"),
-            "voucher": voucher,
-            "store": store_payload.get("store"),
-        }
+        result = self.diagnosis_engine.diagnose("VoucherUnavailable", dx_ctx)
+        payload = result.to_dict()
+        payload["order"] = order_payload.get("order")
+        payload["voucher"] = voucher
+        payload["store"] = store_payload.get("store")
+        return payload
 
     async def regenerate_voucher_qr(self, db: AsyncSession, user_id: str, voucher_id: str) -> dict:
         voucher = await self.vouchers.get(db, voucher_id)
@@ -262,6 +400,19 @@ class LifeServiceTools:
             voucher_payload = await self.query_voucher(db, user_id, voucher_id)
             voucher = voucher_payload["vouchers"][0] if voucher_payload.get("vouchers") else None
             result = {"ok": bool(voucher), "voucher": voucher, "message": "请向商家展示券码进行手动核销"}
+        elif action_id == "create_complaint":
+            ticket = await self.create_complaint(
+                db, session_id, user_id, order_id, payload.get("type", "service"), payload.get("detail", "用户投诉")
+            )
+            result = {"ok": True, "ticket_id": ticket.id, "priority": ticket.priority}
+        elif action_id == "apply_compensation":
+            result = await self.apply_compensation(db, session_id, user_id, order_id, payload.get("reason", "服务补偿"))
+        elif action_id == "appeal":
+            ticket = await self.create_service_ticket(db, session_id, user_id, order_id, "appeal", payload)
+            result = {"ok": True, "ticket_id": ticket.id}
+        elif action_id == "create_ticket":
+            ticket = await self.create_service_ticket(db, session_id, user_id, order_id, payload.get("type", "general"), payload)
+            result = {"ok": True, "ticket_id": ticket.id}
         else:
             result = {"ok": False, "reason": f"未知动作 {action_id}"}
 

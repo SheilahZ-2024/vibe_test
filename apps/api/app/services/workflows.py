@@ -108,24 +108,28 @@ def _is_valid(voucher: dict | None) -> bool:
         return True
 
 
+def _meta(value: object | None) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
 def _needs_reservation(order: dict | None) -> bool:
     if not order:
         return False
-    meta = order.get("metadata") or {}
+    meta = _meta(order.get("metadata"))
     return bool(meta.get("reservation_required"))
 
 
 def _has_reservation(order: dict | None) -> bool:
     if not order:
         return False
-    meta = order.get("metadata") or {}
+    meta = _meta(order.get("metadata"))
     return bool(meta.get("reservation_confirmed") or meta.get("appointment"))
 
 
 def _scanner_synced(store: dict | None) -> bool:
     if not store:
         return False
-    meta = store.get("metadata") or {}
+    meta = _meta(store.get("metadata"))
     return meta.get("scanner_synced", True) is not False
 
 
