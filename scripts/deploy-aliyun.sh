@@ -32,7 +32,14 @@ if [[ ! -f .env ]]; then
   DB_PASS="$(openssl rand -hex 12 2>/dev/null || head -c 24 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 24)"
   sed -i "s/change_me_in_production/${DB_PASS}/g" .env
   sed -i "s/change_me_jwt_or_internal_secret/$(openssl rand -hex 16 2>/dev/null || echo "prod_secret_change_me")/g" .env
-  echo "    已生成 .env，请编辑 LLM_API_KEY 与 CORS_ORIGINS 后重新运行本脚本，或继续用 Mock 模式演示"
+  echo "    已生成 .env（随机数据库密码）"
+fi
+
+if [[ -n "${LLM_API_KEY:-}" ]]; then
+  if grep -q '^LLM_API_KEY=' .env; then
+    sed -i "s|^LLM_API_KEY=.*|LLM_API_KEY=${LLM_API_KEY}|" .env
+  fi
+  echo "    已写入 LLM_API_KEY"
 fi
 
 # 若未设置 CORS，尝试写入公网 IP
