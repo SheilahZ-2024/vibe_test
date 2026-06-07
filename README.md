@@ -12,8 +12,8 @@
 |------|------|
 | **会话式履约服务** | 对话为主界面，订单摘要、履约进度、服务卡片嵌入会话流 |
 | **SDS v1 诊断** | 73 Case 注册表 + 完整诊断树；基于订单/券/门店客观事实与用户话术推理 |
-| **ReAct 智能体** | 查单、查券、查门店、知识检索、诊断、退款、转人工等能力全部 Tool 化，轨迹可观测 |
-| **流式思考 + 回复** | 全中文思考叙述；SSE 流式输出；语气润色保留事实不变 |
+| **Gather ReAct + Compose** | 有界 Gather（模型选工具/规则）+ 单次 Compose 成稿；每轮 2~4 次 LLM |
+| **流式思考 + 回复** | 灰字展示 Gather/Compose 真实推理（`thinking_token`）；正式回复 SSE 流式 |
 | **履约可视化** | 服务进度时间线（购买→预约→到店→核销→售后）；操作记录含退款金额与到账状态 |
 | **120 用户 Mock 场** | 80 正常履约 + 40 异常样本；门店预约策略、券规则、POI 状态完整覆盖 |
 | **实时 Mock 时间** | 规则判断用真实「现在」；启动时自动对齐业务时间到当前时刻 |
@@ -30,14 +30,14 @@ Mock 数据只写入平台/商家/用户侧**可观测事实**：
 - 门店 POI（营业时间、`supports_reservation`、`business_status`、POS 同步时间）
 - 履约事件、退款单记录
 
-数据库**不预置**诊断结论或 Case 标签。跨店、缺预约、拒核销等场景，由**诊断引擎 + ReAct 智能体**读取事实后推理。
+数据库**不预置**诊断结论或 Case 标签。跨店、缺预约、拒核销等场景，由**诊断引擎 + Gather ReAct** 读取事实后推理。
 
-### 2. 智能体主导工具与知识
+### 2. 模型主导核实，程序负责校验
 
-- **ReAct 循环**：模型自主决定查什么、查几次、何时 finish
-- **`search_knowledge`**：按需检索平台政策/FAQ，条数由智能体决定（1~5）
-- **`run_diagnosis`**：结构化诊断树参考，与规则层交叉验证后采纳
-- **异常兜底**：工具或主链路异常时，结构化线索交给 LLM 生成用户可读回复，不暴露技术报错
+- **TurnPlanner**：意图 + 接话模式（不硬编码工具清单）
+- **BoundedGatherReAct**（1~3 步）：模型决定查什么规则、用什么只读工具 / `run_diagnosis`
+- **DecisionComposer**：单次 LLM 成稿（含 emoji）；可选 `AGENT_TONE_POLISH_ENABLED` 二次润色
+- **DecisionVerifier**：预约等硬性约束程序校验
 
 ### 3. 双层时间：规则实时 + 业务对齐
 
@@ -45,9 +45,9 @@ Mock 数据只写入平台/商家/用户侧**可观测事实**：
 - Mock 业务时间以 seed 锚点为基准，API 启动时整体平移到「现在」
 - 前端状态栏显示本机实时时钟
 
-### 4. 体验对用户友好
+### 4. 思考区透传真实推理
 
-思考区将 pipeline / 工具调用翻译为自然中文（「正在帮您查订单…」），过滤内部 Intent/Case 术语。
+Gather 的 `thought`、工具 observation、Compose 的 `understanding` / `reasoning` 经清洗后以 **thinking_token** 流式展示；内部 Intent/Case 编号不暴露。
 
 ### 5. 120 用户一键切换
 
@@ -60,15 +60,24 @@ Mock 数据只写入平台/商家/用户侧**可观测事实**：
 ```text
 ┌─────────────┐     SSE      ┌──────────────────────────────────────┐
 │  apps/web   │ ◄──────────► │  apps/api (FastAPI)                  │
-│  React 会话 │   /stream    │  Orchestrator → FulfillmentAgent     │
-│  BottomSheet│              │    (ReAct) → Tools → DiagnosisEngine │
+│  React 会话 │   /stream    │  Orchestrator → UnifiedTurnPipeline   │
+│  BottomSheet│              │  Plan → Gather ReAct → Compose → Emit│
+│             │              │    → Tools → DiagnosisEngine         │
 └─────────────┘              └──────────┬─────────────┬─────────────┘
                                         │             │
                                    PostgreSQL       Redis
                                    (领域+知识库)    (会话)
 ```
 
-**一次对话路径**：用户输入 → EdgeContext → 意图识别 → 拉取 service-context → ReAct 选工具（含 search_knowledge / run_diagnosis）→ LLM 撰写并润色回复。
+**一次对话路径**：用户输入 → 意图路由 → Gather ReAct 核实（工具 + 诊断）→ Compose 成稿 → SSE 流式输出。
+
+### 关键环境变量
+
+```env
+AGENT_GATHER_MAX_STEPS=3          # Gather ReAct 步数上限
+AGENT_COMPOSE_MAX_TOKENS=768      # 成稿 LLM
+AGENT_TONE_POLISH_ENABLED=false   # true 时二次润色 + emoji（略慢）
+```
 
 详细说明见 **[docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md)**。
 

@@ -1,4 +1,4 @@
-"""Agent 运行时状态 — ReAct 循环共享上下文。"""
+"""Agent 运行时状态 — 统一 Turn Pipeline 共享上下文。"""
 
 from __future__ import annotations
 
@@ -83,7 +83,9 @@ class AgentRunResult:
     diagnosis_advisories: list[dict] = field(default_factory=list)
     knowledge_titles: list[str] = field(default_factory=list)
     pending_confirmations: list[PendingWriteAction] = field(default_factory=list)
-    reply_source: str = "llm_polish"  # draft_direct | llm_polish
+    fact_sheet: dict[str, Any] = field(default_factory=dict)
+    gather_meta: dict[str, Any] = field(default_factory=dict)
+    reply_source: str = "compose"
 
     @property
     def workflow_payload(self) -> dict | None:
@@ -122,3 +124,4 @@ class AgentState:
     executed_tools: set[str] = field(default_factory=set)
     prefetch_done: bool = False
     prior_agent_ctx: dict[str, Any] | None = None
+    gather_meta: dict[str, Any] | None = None

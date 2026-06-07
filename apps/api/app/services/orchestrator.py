@@ -1,4 +1,4 @@
-"""对话入口 — 将 HTTP/SSE 请求委托给 FulfillmentAgent（ReAct），不再维护固定流水线。"""
+"""对话入口 — 将 HTTP/SSE 请求委托给 FulfillmentAgent（统一 Turn Pipeline）。"""
 
 from __future__ import annotations
 
@@ -63,7 +63,7 @@ class ChatOrchestrator:
         workflow_payload: dict | None = None
         agent_finish: dict = {}
 
-        def on_react_step(trace_step, state) -> None:
+        def on_gather_step(trace_step, state) -> None:
             agent_trace.append(trace_step.to_dict())
 
         def pipeline_payload(case: dict | None = None) -> dict:
@@ -93,34 +93,33 @@ class ChatOrchestrator:
                 edge=edge,
                 history=history,
                 service_context=service_context,
-                on_step=on_react_step,
+                on_step=on_gather_step,
             ):
                 if event == "context_ready":
                     intent = payload.get("intent", intent)
                     intent_meta = payload.get("intent_meta") or {}
                     focus_order_id = payload.get("focus_order_id") or focus_order_id
+                    task_type = payload.get("task_type") or intent_meta.get("task_type") or "?"
                     step(
                         "intent_detect",
                         f"[{intent_meta.get('route_category', '?')}] {intent} "
                         f"({int((intent_meta.get('confidence') or 0) * 100)}%, "
-                        f"{intent_meta.get('turn_mode', 'full')}, agent)",
+                        f"{intent_meta.get('turn_mode', 'full')}, {task_type})",
                     )
-                    titles = payload.get("knowledge_titles") or []
-                    step("knowledge_search", ", ".join(titles[:3]) if titles else "按需 search_knowledge")
+                    step("turn_plan", f"task_type={task_type}, gather=react")
                     yield "pipeline", pipeline_payload()
-                elif event == "react_step":
+                elif event == "gather_step":
                     trace_step = payload.get("step") or {}
                     focus_order_id = payload.get("focus_order_id") or focus_order_id
                     action = trace_step.get("action", "?")
                     thought = str(trace_step.get("thought") or "")[:80]
-                    timing = payload.get("timing_ms") or {}
-                    timing_note = ""
-                    if timing:
-                        parts = [f"{k}={v}ms" for k, v in timing.items()]
-                        timing_note = f" ({', '.join(parts)})"
-                    label = "agent_prefetch" if payload.get("prefetch") else "agent_react"
-                    step(label, f"#{trace_step.get('step', '?')} {action}: {thought}{timing_note}")
-                    yield "react_step", payload
+                    label = "agent_gather_react" if payload.get("phase") == "gather_react" else "agent_gather"
+                    if payload.get("prefetch"):
+                        label = "agent_prefetch"
+                    step_ms = payload.get("step_ms")
+                    timing_note = f" step={step_ms}ms" if step_ms else ""
+                    step(label, f"{action}: {thought}{timing_note}")
+                    yield "gather_step", payload
                     yield "pipeline", pipeline_payload()
                 elif event == "thinking":
                     yield "thinking", payload
@@ -134,10 +133,16 @@ class ChatOrchestrator:
                     focus_order_id = payload.get("focus_order_id") or focus_order_id
                     agent_finish = payload.get("finish") or {}
                     if agent_finish.get("mode") == "clarify":
-                        step("agent_decision", "clarify — 大模型判断需先澄清")
+                        step("agent_decision", "clarify — Compose 判断需先澄清")
                     else:
                         step("agent_decision", f"reply — safe={agent_finish.get('safe_to_send', True)}")
-                    step("tool_action", f"{payload.get('tool_count', 0)} calls via ReAct")
+                    compose_ms = payload.get("compose_ms")
+                    reply_src = payload.get("reply_source") or "compose"
+                    compose_detail = f"{reply_src}"
+                    if compose_ms is not None:
+                        compose_detail += f" {compose_ms}ms"
+                    step("agent_compose", compose_detail)
+                    step("tool_action", f"{payload.get('tool_count', 0)} calls via Gather")
                     yield "pipeline", pipeline_payload()
                 elif event == "token":
                     reply_stream_started = True

@@ -6,6 +6,7 @@ import re
 from typing import Any
 
 from app.services.intent import INTENT_CATALOG, IntentResult
+from app.services.turn_plan import TurnPlan
 from app.services.tool_payloads import (
     normalize_focus_bundle,
     order_from_payload,
@@ -312,6 +313,138 @@ def build_fast_turn_thought_lines(turn_mode: str) -> list[str]:
         "接着刚才的话题说～",
         "上一轮查到的还在，我直接接着用。",
     ]
+
+
+def format_rules_hint(rules: list | None) -> str | None:
+    items = [str(r).strip() for r in (rules or []) if str(r).strip()]
+    if not items:
+        return None
+    joined = "、".join(items[:4])
+    return f"这块得先弄清 {joined}～"
+
+
+def format_diagnosis_thought(adv: dict) -> str | None:
+    if not isinstance(adv, dict) or adv.get("ok") is False:
+        return None
+    name = str(adv.get("case_name") or "").strip()
+    if not name:
+        return None
+    solutions = adv.get("solution") or []
+    titles = "、".join(str(s.get("title") or "") for s in solutions[:2] if s.get("title"))
+    if titles:
+        return f"对照规则更像是 {name}，可以考虑 {titles}"
+    return f"对照规则更像是 {name}"
+
+
+def format_gather_thought(thought: str, *, rules: list | None = None) -> str | None:
+    """Gather ReAct 模型 thought — 清洗后直接展示。"""
+    cleaned = _sanitize(thought, 320)
+    if not cleaned:
+        return None
+    if rules:
+        rule_text = "、".join(str(r) for r in rules[:4] if str(r).strip())
+        if rule_text and rule_text not in cleaned and not any(r in cleaned for r in rules[:4]):
+            cleaned = f"{cleaned}（核对：{rule_text}）"
+    return cleaned
+
+
+def format_tool_observation_thought(
+    action: str,
+    observation: Any,
+    service_context: dict | None = None,
+) -> str | None:
+    """工具 observation 转成一句用户可读事实。"""
+    lines = _observation_lines(action, observation, service_context or {})
+    if not lines:
+        return None
+    return _sanitize(lines[0], 200)
+
+
+def format_compose_thought_lines(payload: dict[str, Any]) -> list[str]:
+    """Compose JSON 里的 understanding / reasoning — 更完整、可流式展示。"""
+    lines: list[str] = []
+    understanding = payload.get("understanding") if isinstance(payload.get("understanding"), dict) else {}
+    goal = str(understanding.get("user_goal") or "").strip()
+    if goal:
+        lines.append(_sanitize(goal, 240))
+    if understanding.get("references_prior_turn"):
+        lines.append("您这是在接着上一句说，我按刚才查到的继续往下捋。")
+
+    reasoning = payload.get("reasoning") if isinstance(payload.get("reasoning"), dict) else {}
+    rule = str(reasoning.get("rule_application") or "").strip()
+    if rule and rule not in (goal or ""):
+        lines.append(_sanitize(rule, 280))
+
+    rejected = reasoning.get("alternatives_rejected") or []
+    if isinstance(rejected, list):
+        for alt in rejected[:2]:
+            t = str(alt).strip()
+            if t and len(t) > 4:
+                lines.append(f"不太像{_sanitize(t, 100)}这种情况。")
+
+    self_check = payload.get("self_check") if isinstance(payload.get("self_check"), dict) else {}
+    conf = self_check.get("confidence")
+    if isinstance(conf, (int, float)) and conf >= 0.85:
+        lines.append("信息和规则对得上，可以给您明确答复了。")
+    missing = self_check.get("missing_info") or []
+    if self_check.get("needs_clarify") and isinstance(missing, list) and missing:
+        miss = "、".join(str(m) for m in missing[:3])
+        lines.append(f"还得跟您确认 {miss}。")
+    return [ln for ln in lines if ln.strip()]
+
+
+def build_plan_thought_lines(plan: TurnPlan) -> list[str]:
+    """Plan 阶段不再输出套话，思考区留给 Gather/Compose 真推理。"""
+    return []
+
+
+def build_gather_react_thought_lines(
+    trace: list,
+    fact_sheet: dict,
+    gather_meta: dict | None,
+) -> list[str]:
+    """Gather 结束后兜底（正常应在 gather 流中已逐条推送）。"""
+    lines: list[str] = []
+    meta = gather_meta or {}
+    seen: set[str] = set()
+    for step in trace:
+        action = str(getattr(step, "action", "") or "")
+        thought = str(getattr(step, "thought", "") or "").strip()
+        if action == "gather_complete":
+            summary = str(meta.get("gather_summary") or thought).strip()
+            if summary and summary not in seen:
+                seen.add(summary)
+                lines.append(_sanitize(summary, 240))
+            continue
+        if thought:
+            t = _sanitize(thought, 200)
+            if t and t not in seen:
+                seen.add(t)
+                lines.append(t)
+        obs_line = format_tool_observation_thought(action, getattr(step, "observation", None), {})
+        if obs_line and obs_line not in seen:
+            seen.add(obs_line)
+            lines.append(obs_line)
+    return lines
+
+
+def build_gather_thought_lines(tool_calls: list[dict], fact_sheet: dict) -> list[str]:
+    if not tool_calls:
+        return ["事实都在会话记忆里，这轮没再跑工具。"]
+    lines: list[str] = []
+    for tc in tool_calls[-4:]:
+        if not isinstance(tc, dict):
+            continue
+        name = str(tc.get("name") or "")
+        for obs_line in _observation_lines(name, tc.get("result"), {})[:2]:
+            lines.append(obs_line)
+    if fact_sheet.get("needs_reservation") and not fact_sheet.get("has_reservation"):
+        lines.append("这笔需要先预约才能核销，回复里得把这个讲清楚。")
+    return lines or ["核实结果齐了，可以往下写回复。"]
+
+
+def build_compose_thought_lines(payload: dict[str, Any], *, compose_ms: int = 0) -> list[str]:
+    return format_compose_thought_lines(payload)
 
 
 def build_react_thought_lines(

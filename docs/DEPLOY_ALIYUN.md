@@ -77,6 +77,8 @@ Demo 用户见 [DEMO_GUIDE.md](./DEMO_GUIDE.md)。
 
 ## 五、日常更新（本机 PowerShell）
 
+**推荐流程**：先 `git push` 到 GitHub，再 tar 上传（服务器可无 git）。
+
 ```powershell
 cd C:\Users\15924\Projects\smart-assistant
 

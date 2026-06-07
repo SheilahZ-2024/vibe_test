@@ -1,4 +1,4 @@
-"""终稿语气润色 — 仅处理已确认的正文，不改事实。"""
+"""终稿语气润色 — Compose 成稿后的可选轻量口语化（默认关；开启时加 emoji）。"""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from app.config import settings
 from app.services.llm import LLMService
 
 POLISH_SYSTEM = """你是抖音生活服务 AI 履约管家的语气润色器。只做轻量口语化，不重写结构：
-- 更自然亲切；可酌情加 1-2 个 emoji，勿堆砌
+- 更自然亲切；**务必保留或补上 1~2 个贴切 emoji**（😊 📞 ✅ 👌 ⚠️ 等），勿堆砌
 - 金额、订单号、券码、时间、门店名、能否退款等事实必须原样保留，禁止增删改
 - 禁止新增政策、承诺或步骤；不用 markdown 列表
 - clarify 场景：语气温和、问题清楚

@@ -2,12 +2,18 @@ import type { PipelineStep } from "../types";
 
 const names: Record<string, string> = {
   intent_detect: "意图识别",
+  turn_plan: "Turn 规划",
   service_context: "读取服务上下文",
   knowledge_search: "检索知识库",
   diagnosis_tree: "执行诊断树",
   case_generate: "生成 Case",
   workflow_match: "服务体系匹配",
   tool_action: "业务工具调用",
+  agent_gather: "Gather 核实",
+  agent_gather_react: "Gather ReAct",
+  agent_prefetch: "聚焦预取",
+  agent_compose: "Compose 成稿",
+  agent_decision: "决策校验",
   prompt_build: "组装模型上下文",
   model_response: "流式模型回复",
 };

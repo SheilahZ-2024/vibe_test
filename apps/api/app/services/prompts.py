@@ -1,4 +1,4 @@
-"""Agent Prompt 构建 — ReAct 推理与最终回复（分层压缩以降低 token）。"""
+"""Agent Prompt 构建 — 【已废弃】原 ReAct 路径；统一 Pipeline 请用 compose_prompts.py。"""
 
 from __future__ import annotations
 

@@ -9,7 +9,7 @@ import { PhoneShell } from "./components/PhoneShell";
 import { PlusMenu, type PlusMenuTarget } from "./components/PlusMenu";
 import { PrivacySettings } from "./components/PrivacySettings";
 import { ThinkingStream } from "./components/ThinkingStream";
-import { THINKING_PLACEHOLDER } from "./lib/thinking";
+import { THINKING_PLACEHOLDER, appendThinkingLine } from "./lib/thinking";
 import { reservationLabel } from "./lib/reservation";
 import { getStoredFocusOrderId, resolveFocusOrderId, setStoredFocusOrderId } from "./lib/orderFocus";
 import { getStoredUserId, resolveUserId, setStoredUserId } from "./lib/userSession";
@@ -278,7 +278,7 @@ export default function App() {
         await streamChat(sid, content, edge, {
           onPipeline: (payload) => {
             const steps = payload.pipeline?.steps ?? [];
-            if (steps.some((s) => s.name === "agent_react" || s.name === "agent_decision")) {
+            if (steps.some((s) => s.name === "agent_gather" || s.name === "agent_gather_react" || s.name === "agent_compose" || s.name === "agent_decision")) {
               setStreamPhase("observing");
             }
             setServiceCards((payload.service_cards ?? []) as ServiceCard[]);
@@ -291,13 +291,11 @@ export default function App() {
           onThinking: (payload) => {
             if (payload.line) {
               setThinkingText((prev) => {
-                const line = payload.line!.trim();
-                if (!line) return prev;
                 if (thinkingPlaceholderRef.current) {
                   thinkingPlaceholderRef.current = false;
-                  return line;
+                  return payload.line!.trim();
                 }
-                return prev ? `${prev}\n${line}` : line;
+                return appendThinkingLine(prev, payload.line!);
               });
             }
             setStreamPhase("observing");

@@ -1,6 +1,6 @@
 import { useThinkingReveal } from "../lib/thinkingReveal";
 
-/** 流式思考 — 单段灰字，逐字有节奏，像人在自言自语 */
+/** 流式思考 — 展示 Gather/Compose 真实推理，按段灰字 */
 export function ThinkingStream({
   text,
   active,
@@ -14,24 +14,27 @@ export function ThinkingStream({
 
   if (!revealed.trim()) return null;
 
+  const paragraphs = revealed.split(/\n\n+/).filter((p) => p.trim());
+
   return (
     <div className="flex justify-start">
       <div
-        className={`max-w-[92%] border-l-2 border-slate-200 pl-3 leading-[1.75] tracking-wide text-slate-400 ${
-          compact ? "text-[12px]" : "text-[13px]"
+        className={`max-w-[92%] border-l-2 border-slate-200/80 pl-3 leading-relaxed tracking-normal text-slate-500/90 ${
+          compact ? "text-[12px] leading-[1.65]" : "text-[13px] leading-[1.7]"
         }`}
       >
-        <p className={`whitespace-pre-wrap ${active ? "text-slate-500" : ""}`}>
-          {revealed}
-          {active && indexBehind(text, revealed) ? (
-            <span className="ml-0.5 inline-block animate-pulse text-slate-400">▍</span>
-          ) : null}
-        </p>
+        {paragraphs.map((para, i) => (
+          <p
+            key={`${i}-${para.slice(0, 24)}`}
+            className={`whitespace-pre-wrap ${i > 0 ? "mt-2.5" : ""} ${active && i === paragraphs.length - 1 ? "text-slate-600" : ""}`}
+          >
+            {para.trim()}
+          </p>
+        ))}
+        {active ? (
+          <span className="mt-1 inline-block h-[1em] w-0.5 animate-pulse bg-slate-400/70 align-middle" aria-hidden />
+        ) : null}
       </div>
     </div>
   );
-}
-
-function indexBehind(full: string, shown: string): boolean {
-  return shown.length < full.length;
 }

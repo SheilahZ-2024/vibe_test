@@ -1,4 +1,4 @@
-"""跨轮会话记忆 — 供接话 ReAct 复用上一轮查数结果。"""
+"""跨轮会话记忆 — 供统一 Pipeline 接话复用上一轮查数结果与 fact_sheet。"""
 
 from __future__ import annotations
 
@@ -100,6 +100,34 @@ def summarize_tool_call(name: str, result: Any) -> str | None:
     return None
 
 
+_FACT_SHEET_KEYS = (
+    "focus_order_id",
+    "order_id",
+    "order_title",
+    "order_status",
+    "usage_rule",
+    "voucher_code",
+    "voucher_status",
+    "store_name",
+    "store_phone",
+    "store_hours",
+    "needs_reservation",
+    "has_reservation",
+    "reservation_label",
+    "reservation_detail",
+    "diagnosis_case_id",
+    "diagnosis_case_name",
+    "can_refund",
+    "refundable_amount",
+)
+
+
+def _compact_fact_sheet(facts: dict | None) -> dict:
+    if not facts:
+        return {}
+    return {k: facts[k] for k in _FACT_SHEET_KEYS if k in facts and facts[k] not in (None, "")}
+
+
 def build_agent_context(result: AgentRunResult) -> dict:
     """持久化到 Redis，供下一轮接话读取。"""
     lines: list[str] = []
@@ -127,6 +155,9 @@ def build_agent_context(result: AgentRunResult) -> dict:
         "digest": "\n".join(lines[:8]),
         "last_reply": _clip(result.finish.draft_message, 480),
         "tool_names": [str(tc.get("name")) for tc in result.tool_calls[-8:] if isinstance(tc, dict) and tc.get("name")],
+        "fact_sheet": _compact_fact_sheet(result.fact_sheet),
+        "gather_summary": _clip(str((result.gather_meta or {}).get("gather_summary") or ""), 320),
+        "rules_checked": list((result.gather_meta or {}).get("rules_to_check") or [])[:6],
     }
 
 
@@ -140,6 +171,14 @@ def format_memory_block(ctx: dict | None) -> str:
     digest = str(ctx.get("digest") or "").strip()
     if digest:
         parts.append("已掌握事实：\n" + digest)
+    fs = ctx.get("fact_sheet") if isinstance(ctx.get("fact_sheet"), dict) else {}
+    if fs.get("store_phone"):
+        parts.append(f"门店电话（已核实）：{fs['store_phone']}")
+    if fs.get("needs_reservation") is True:
+        parts.append(f"预约要求（已核实）：{fs.get('reservation_label') or '需预约'}")
+    gs = str(ctx.get("gather_summary") or "").strip()
+    if gs:
+        parts.append(f"上一轮 Gather 摘要：\n{gs}")
     last = str(ctx.get("last_reply") or "").strip()
     if last:
         parts.append("上一轮回复摘要：\n" + last)

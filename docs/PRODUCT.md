@@ -32,8 +32,8 @@
 
 已实现：
 
-- 完整 ReAct 智能体 + 工具链 + SDS 诊断
-- 120 用户 mock 场 + 流式思考与回复
+- **Plan → Gather ReAct → Compose** 统一 Pipeline + SDS 诊断
+- 120 用户 mock 场 + 流式思考（真实推理）与流式回复
 - 履约时间线、操作记录、退款可视化
 
 ---

@@ -28,7 +28,11 @@ flowchart TB
   subgraph api ["apps/api"]
     Chat["routers/chat.py SSE"]
     Orch["ChatOrchestrator"]
-    Agent["FulfillmentAgent ReAct"]
+    Agent["FulfillmentAgent\nUnifiedTurnPipeline"]
+    Plan["TurnPlanner"]
+    Gather["BoundedGatherReAct"]
+    Compose["DecisionComposer"]
+    Verify["DecisionVerifier"]
     Tools["AgentToolExecutor"]
     DX["DiagnosisEngine SDS v1"]
     Recovery["ErrorRecoveryService"]
@@ -44,9 +48,13 @@ flowchart TB
   Edge --> Chat
   Chat --> Orch
   Orch --> Agent
-  Agent --> Tools
+  Agent --> Plan
+  Agent --> Gather
+  Gather --> Tools
+  Agent --> Compose
+  Compose --> Verify
+  Compose --> LLM
   Tools --> DX
-  Agent --> LLM
   Orch --> Recovery
   Tools --> PG
   Chat --> RD
@@ -61,13 +69,22 @@ apps/api/app/
   routers/chat.py         SSE 对话入口
   services/
     orchestrator.py       会话 I/O、pipeline 事件
-    fulfillment_agent.py  ReAct 主循环
+    fulfillment_agent.py  统一 Pipeline 对外入口
+    unified_turn_pipeline.py  Plan → Gather → Compose → Emit
+    turn_plan.py          轻量路由（意图/接话，不硬编码工具）
+    gather_react.py       有界 Gather ReAct（模型选工具/规则）
+    gather_prompts.py     Gather ReAct 提示词
+    evidence_gatherer.py    Mock 程序回退 Gather
+    decision_composer.py  单次 Compose LLM
+    decision_verifier.py  程序校验 + 重试
+    compose_prompts.py    Compose 提示词
     agent_tools.py        工具执行器
     error_recovery.py     异常兜底（LLM + 结构化线索）
     tools.py              领域查询/写操作
     usage_rules.py        券规则/营业时段解析
-    reply_polisher.py     终稿语气润色
-    thinking_narrative.py 思考文案中文化
+    conversation_memory.py 跨轮 fact_sheet / digest
+    thinking_narrative.py 思考清洗（透传模型 thought）
+    thinking_stream.py     thinking_token 流式推送
   diagnosis/              SDS v1：registry, engine, matrices
   db/
     bulk_bootstrap.py     mock 幂等重灌（version 检测）
@@ -93,17 +110,18 @@ sequenceDiagram
   U->>W: 输入
   W->>O: POST /chat/stream
   O->>A: run_stream
-  A->>L: 意图分类
-  loop ReAct 2~5 步
-    A->>L: 下一步工具？
-    A->>T: query_* / search_knowledge / run_diagnosis
+  A->>L: 意图分类（TurnPlanner，仅路由）
+  loop Gather ReAct 1~3 步
+    A->>L: 查什么规则/用什么工具？
+    A->>T: 只读 tool 或 run_diagnosis
     T->>D: diagnose 可选
     D-->>T: CaseDiagnosisResult
-    T-->>A: observation
+    T-->>A: observation → 回传 ReAct
   end
-  A->>L: 终稿 / draft
-  A->>L: 语气润色 stream
-  L-->>W: SSE token
+  A->>L: Compose 单次 JSON（理解+推理+自监督+成稿）
+  A->>A: DecisionVerifier 程序校验
+  L-->>W: SSE token（Compose 成稿；可选 tone polish）
+  L-->>W: SSE thinking_token（Gather/Compose 推理流）
   O-->>W: SSE done
 ```
 
@@ -115,29 +133,47 @@ sequenceDiagram
 
 关键词优先 + 轻量 LLM；置信度低于阈值走 `clarify`；`chitchat` 短回复并引导回履约话题。
 
-### 3.3 ReAct 智能体
+### 3.3 统一 Turn Pipeline（Gather ReAct + Compose）
 
-`FulfillmentAgent` 在多轮中：
+每轮用户消息固定走 **Plan → Gather ReAct → Compose → Verify → Emit**：
 
-1. 按需调用 **`search_knowledge`**（query、limit 由模型决定）
-2. 调用 `query_order` / `query_voucher` / `query_store` 等读工具
-3. 可选 **`run_diagnosis`** 获取结构化 Case 参考
-4. `finish` 产出 draft → 语气润色 → SSE 流式输出
+1. **TurnPlanner（轻量）**：意图分类 + `task_type` + 接话模式；**不**硬编码工具清单
+2. **BoundedGatherReAct（有界 1~3 步）**：模型主导
+   - 决定核对哪些**规则**（`rules_to_check`）
+   - 选择**只读工具** / `run_diagnosis` / `search_knowledge`
+   - 每步 `thought → action → observation` 写入 trace
+   - 结束时 `gather_complete` + `gather_summary`；写操作不在此阶段执行
+3. **fact_sheet**：程序从 tool_calls + 诊断结果结构化抽取
+4. **DecisionComposer**：**唯一成稿 LLM**；消费 **完整 Gather trace** + fact_sheet + 诊断
+5. **DecisionVerifier**：预约硬性约束等程序校验
+6. **Emit**：流式输出 reply；`AGENT_TONE_POLISH_ENABLED=true` 时可选二次润色（补 emoji）
 
-业务结论来自 **Tool observation + 诊断树**，智能体综合裁决是否采纳 Case。
+致谢接话：`skip_gather_react` + Compose 模板，0~1 次 LLM。
+
+配置：`AGENT_GATHER_MAX_STEPS=3`、`AGENT_GATHER_*`、`AGENT_COMPOSE_*`、`AGENT_TONE_POLISH_ENABLED`（默认 false）。
 
 ### 3.4 异常处理
 
 | 层级 | 行为 |
 |------|------|
-| 工具异常 | 返回结构化 `clues`，ReAct 继续推理 |
+| 工具异常 | 返回结构化 `clues`，Gather 写入 trace |
 | 主链路崩溃 | `ErrorRecoveryService` 将上下文交给 LLM 生成可读回复 |
 
 不向用户暴露 Python 堆栈或内部术语。
 
 ### 3.5 思考区
 
-`thinking_narrative.py` 将工具名、步骤映射为中文叙述；前端 `sanitizeThinkingLine` 兜底过滤漏网术语。
+| 来源 | 展示内容 |
+|------|----------|
+| Gather 预取 / 工具 | observation 事实摘要（订单/券/门店） |
+| Gather ReAct | 模型 `thought`、`rules_to_check`、诊断 Case |
+| Compose | `understanding.user_goal`、`reasoning.rule_application` |
+
+`thinking_stream.py` 以 **thinking_token** 带节奏流式推送；前端 `ThinkingStream` 按段灰字展示。`thinking_narrative._sanitize` 替换工具名、剥离 Case 编号。
+
+### 3.6 跨轮记忆
+
+`conversation_memory` 持久化 `fact_sheet`、`gather_summary`、`digest`，供接话轮 Gather ReAct 复用。
 
 ---
 
@@ -168,7 +204,7 @@ Intent → DiagnosisContext → 诊断树逐步校验 → Case → 动作矩阵 
 - **主屏**：会话 + 焦点订单 + 思考流 + 快捷话术
 - **+ 半屏**：履约时间线、历史订单、操作记录、授权
 - **DemoUserSwitcher**：120 用户
-- **SSE**：`thinking` / `token` / `pipeline` / `done`
+- **SSE**：`thinking_token` / `token` / `gather_step` / `pipeline` / `done`
 
 ---
 

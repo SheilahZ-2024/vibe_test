@@ -100,8 +100,31 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("AGENT_HIDE_ATOMIC_FOCUS_READS"),
     )
     agent_fast_turn_enabled: bool = Field(
-        default=True,
+        default=False,
         validation_alias=AliasChoices("AGENT_FAST_TURN_ENABLED"),
+    )
+
+    agent_compose_temperature: float = Field(
+        default=0.35,
+        validation_alias=AliasChoices("AGENT_COMPOSE_TEMPERATURE"),
+    )
+    agent_compose_max_tokens: int = Field(
+        default=768,
+        validation_alias=AliasChoices("AGENT_COMPOSE_MAX_TOKENS"),
+    )
+    agent_compose_max_retries: int = Field(
+        default=1,
+        validation_alias=AliasChoices("AGENT_COMPOSE_MAX_RETRIES"),
+    )
+
+    agent_gather_max_steps: int = Field(default=3, validation_alias=AliasChoices("AGENT_GATHER_MAX_STEPS"))
+    agent_gather_temperature: float = Field(
+        default=0.2,
+        validation_alias=AliasChoices("AGENT_GATHER_TEMPERATURE", "AGENT_REACT_TEMPERATURE"),
+    )
+    agent_gather_max_tokens: int = Field(
+        default=512,
+        validation_alias=AliasChoices("AGENT_GATHER_MAX_TOKENS", "AGENT_REACT_MAX_TOKENS"),
     )
 
     error_recovery_use_llm: bool = Field(default=True, validation_alias=AliasChoices("ERROR_RECOVERY_USE_LLM"))
