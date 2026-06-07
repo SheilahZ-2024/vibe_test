@@ -136,14 +136,14 @@ Compose 输出的 `suggested_actions` 应尽量包含可执行选项：
 | **大模型（Gather ReAct）** | 查什么规则、调哪些工具、何时结束 Gather |
 | **大模型（Compose）** | 如何向用户解释、建议什么动作 |
 | **程序（fact_sheet）** | 结构化事实抽取，防编造 |
-| **程序（Verify）** | 预约硬约束等不可违反的规则 |
+| **程序（Verify）** | 嵌在 Compose 模块内：预约硬约束等不可违反的规则 |
 | **用户（ActionSheet）** | 写操作最终确认 |
 
 ---
 
 ## 六、统一 Pipeline 产品视角
 
-从技术视角，每轮对话走 **Plan → Gather → Compose → Verify → Emit**：
+从技术视角，每轮对话走 **Plan → Gather → fact_sheet → Compose（内含 Verify）→ Emit**：
 
 ```text
 ┌─────────────────────────────────────────────────────────────┐
@@ -152,15 +152,16 @@ Compose 输出的 `suggested_actions` 应尽量包含可执行选项：
 │   接话模式：新话题 / 续问 / 致谢                              │
 ├─────────────────────────────────────────────────────────────┤
 │ Gather 核实（用户看到思考区灰字）                             │
-│   模型决定：先查 focus_bundle，再 run_diagnosis               │
+│   模型决定：先查 focus_bundle，再 run_diagnosis → SDS         │
 │   核对规则：「须提前预约」「订单无预约记录」                    │
+│   SDS/工具 observation 回写 Gather 下一步 LLM                │
+├─────────────────────────────────────────────────────────────┤
+│ fact_sheet 事实表（程序，用户无感知）                         │
+│   汇总查库 + usage_rules + SDS Case 标签；非 LLM 推理摘要      │
 ├─────────────────────────────────────────────────────────────┤
 │ Compose 成稿（用户看到正式回复）                              │
-│   单次 LLM：理解 + 推理 + 回复 + 建议动作                     │
-│   例：「这张券须先预约才能核销 📅，我帮您创建预约？」          │
-├─────────────────────────────────────────────────────────────┤
-│ Verify 校验（用户无感知）                                     │
-│   程序检查：不能说出「无需预约直接核销」                       │
+│   单次 LLM：读 trace + fact_sheet + 诊断块 → 写 reply        │
+│   内部 Verify：拦截「须预约却说可直接核销」等，失败则重写       │
 ├─────────────────────────────────────────────────────────────┤
 │ Emit 输出                                                    │
 │   流式推送正式回复；可选语气润色                               │
@@ -266,7 +267,7 @@ Compose 输出的 `suggested_actions` 应尽量包含可执行选项：
 
 | 能力 | 状态 |
 |------|------|
-| Plan → Gather ReAct → Compose → Verify → Emit 统一 Pipeline | ✅ |
+| Plan → Gather ReAct → fact_sheet → Compose（含 Verify）→ Emit 统一 Pipeline | ✅ |
 | SDS v1 诊断（73 Case） | ✅ |
 | 15 个 Agent 工具（10 只读 + 5 写） | ✅ |
 | 流式思考（真实推理）+ 流式回复 | ✅ |
@@ -340,7 +341,7 @@ Mock 数据写入的是**可观测业务事实**：
 | 「找人工」 | HumanTransfer | 建工单 |
 | 「谢谢」 | acknowledgment | 模板接话，0 LLM |
 
-完整 27 意图见 [ARCHITECTURE.md](./ARCHITECTURE.md) 第 6 节。
+完整 26 意图见 [ARCHITECTURE.md](./ARCHITECTURE.md) 第 6 节。
 
 ---
 

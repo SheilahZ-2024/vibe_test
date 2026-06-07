@@ -2,7 +2,7 @@
 
 AI 履约服务管家的技术分层、关键模块与数据流。本文档与源码对齐，术语采用 **「中文名（EnglishName）」** 格式，便于阅读与检索。
 
-> **主链路**：`TurnPlanner` → `BoundedGatherReAct` → `DecisionComposer` → `DecisionVerifier` → `Emit`  
+> **主链路**：`TurnPlanner` → `BoundedGatherReAct` → `fact_sheet` → `DecisionComposer`（内含 `DecisionVerifier`）→ `Emit`  
 > **入口文件**：`apps/api/app/services/unified_turn_pipeline.py`  
 > 旧版多轮 ReAct Agent 已移除；`fulfillment_agent.py` 仅为 Pipeline 薄封装。
 
@@ -22,69 +22,234 @@ AI 履约服务管家的技术分层、关键模块与数据流。本文档与�
 
 ## 2. 总体架构
 
-### 2.1 分层图
+### 2.1 分层图（按代码实现）
+
+下图反映 **真实调用关系**：`DecisionVerifier` 嵌在 `DecisionComposer` 内部；SDS 由 `run_diagnosis` 工具触发；Gather 工具 observation **回写**下一轮 Gather LLM；`ServiceContextBuilder` 在 Orchestrator 中先于 Pipeline 执行。
 
 ```mermaid
 flowchart TB
-  subgraph client ["客户端 apps/web"]
-    UI["App.tsx 会话主界面"]
-    Sheet["BottomSheet 半屏面板"]
-    Edge["EdgeContext 授权上下文包"]
+  subgraph web ["客户端 apps/web"]
+    App["App.tsx 会话主界面"]
+    SSEClient["client.ts SSE 客户端"]
+    Sheet["BottomSheet 半屏<br/>REST 读时间线/订单/记录"]
   end
 
-  subgraph api ["服务端 apps/api"]
-    Chat["routers/chat.py SSE 入口"]
-    Orch["ChatOrchestrator 编排层"]
-    Agent["FulfillmentAgent 智能体入口"]
-    Pipe["UnifiedTurnPipeline 统一管线"]
-    Plan["TurnPlanner 轮次规划"]
-    Gather["BoundedGatherReAct 有界 Gather"]
-    Compose["DecisionComposer 决策成稿"]
-    Verify["DecisionVerifier 程序校验"]
-    Tools["AgentToolExecutor 工具执行器"]
-    DX["DiagnosisEngine SDS 诊断引擎"]
-    Recovery["ErrorRecoveryService 异常兜底"]
-    LLM["LLMService 大模型服务"]
+  subgraph http ["HTTP 入口"]
+    ChatRouter["routers/chat.py<br/>POST /chat/stream"]
+    RestAPI["routers/* 其它 REST"]
   end
+
+  subgraph orch ["编排层 ChatOrchestrator"]
+    Orch["会话校验 · SSE 转发 · 持久化"]
+    CtxB["ServiceContextBuilder<br/>拉订单/券/门店概况"]
+    Sess["SessionStore<br/>历史消息 + agent_context"]
+  end
+
+  subgraph pipe ["UnifiedTurnPipeline（FulfillmentAgent 薄封装转发）"]
+    Plan["TurnPlanner<br/>+ IntentClassifier"]
+    subgraph gatherBox ["BoundedGatherReAct"]
+      GL["Gather LLM 循环 1~3 步"]
+    end
+    FS["fact_sheet 程序抽取"]
+    subgraph composeBox ["DecisionComposer"]
+      CL["Compose LLM"]
+      Verify["DecisionVerifier<br/>（模块内部校验循环）"]
+      CL --> Verify
+      Verify -->|"失败：错误反馈"| CL
+    end
+    Emit["Emit：ReplyPolisher + token SSE"]
+    Plan --> gatherBox --> FS --> composeBox --> Emit
+  end
+
+  subgraph toolLayer ["工具与规则层（程序，非 LLM）"]
+    Exec["AgentToolExecutor"]
+    LifeTools["LifeServiceTools"]
+    RunDx["run_diagnosis 工具入口"]
+    Rules["usage_rules 等业务规则解析"]
+    SDS["DiagnosisEngine<br/>SDS 73 Case 诊断树"]
+  end
+
+  LLM["LLMService<br/>Plan / Gather / Compose / Polish 共享"]
 
   subgraph data ["数据层"]
-    PG[("PostgreSQL 业务库")]
-    RD[("Redis 会话缓存")]
+    PG[("PostgreSQL")]
+    RD[("Redis")]
   end
 
-  UI --> Chat
-  Edge --> Chat
-  Chat --> Orch
-  Orch --> Agent
-  Agent --> Pipe
-  Pipe --> Plan
-  Pipe --> Gather
-  Gather --> Tools
-  Pipe --> Compose
-  Compose --> Verify
-  Compose --> LLM
-  Tools --> DX
-  Orch --> Recovery
-  Tools --> PG
-  Chat --> RD
-  Sheet --> PG
+  Rec["ErrorRecoveryService<br/>主链路异常兜底"]
+
+  App --> SSEClient
+  App --> Sheet
+  SSEClient -->|"SSE"| ChatRouter
+  Sheet -->|"REST"| RestAPI
+  RestAPI --> PG
+
+  ChatRouter --> Orch
+  Orch --> CtxB --> PG
+  Orch --> Sess --> RD
+  Orch --> pipe
+
+  Plan --> LLM
+  GL --> LLM
+  CL --> LLM
+  Emit --> LLM
+
+  GL -->|"选 action"| Exec
+  Exec --> LifeTools --> PG
+  Exec --> RunDx --> SDS
+  LifeTools --> Rules
+  SDS --> Rules
+  Exec -->|"observation → trace"| GL
+  SDS -->|"Case 结果 → trace + advisories"| GL
+
+  Orch -.->|"主链路异常"| Rec
+  Rec --> LLM
 ```
 
-**各层中文说明**：
+**各层中文说明**（与上图中模块一一对应）：
 
-| 英文模块 | 中文职责 |
+| 模块 | 中文职责 | 代码位置 |
+|------|----------|----------|
+| **ChatOrchestrator** | 校验用户；**先**拉 service-context；转发 Pipeline 事件为 SSE；写对话与 Redis 跨轮记忆 | `orchestrator.py` |
+| **FulfillmentAgent** | 类名兼容层，100% 转发 `UnifiedTurnPipeline.run_stream` | `fulfillment_agent.py` |
+| **TurnPlanner** | 意图 + 接话模式 + task_type；不硬编码 Gather 工具 | `turn_plan.py` + `intent.py` |
+| **BoundedGatherReAct** | 有界 ReAct：LLM 选工具/规则，observation **回到下一步 LLM** | `gather_react.py` |
+| **AgentToolExecutor** | 执行 `query_*` / `run_diagnosis` 等；写操作在 Gather 阶段 gate | `agent_tools.py` |
+| **run_diagnosis → SDS** | 工具触发诊断引擎；SDS 是**独立程序模块**，不是 LLM | `agent_tools.py` → `diagnosis/engine.py` |
+| **usage_rules** | 从券面文案/门店/当前时间程序推导预约、时段等约束 | `usage_rules.py` |
+| **fact_sheet** | Gather 结束后程序汇总查库 + 规则 + Case 标签；**独立模块，非 SDS**；供 Compose / Verify / Redis | `fact_sheet.py` |
+| **DecisionComposer** | 唯一成稿 LLM；prompt 含完整 Gather trace + fact_sheet + 诊断结论 | `decision_composer.py` |
+| **DecisionVerifier** | **嵌在 Composer 内部**：检查 Compose JSON，失败则 **同一 LLM 重写** | `decision_verifier.py` |
+| **Emit / ReplyPolisher** | Verify 通过后流式输出 reply（可选二次润色） | `unified_turn_pipeline.py` + `reply_polisher.py` |
+| **ErrorRecoveryService** | 主链路崩溃时的兜底回复（旁路，非每轮必经） | `error_recovery.py` |
+
+**与旧版分层图的修正点**：
+
+| 旧图问题 | 实际实现 |
 |----------|----------|
-| **ChatOrchestrator** | 会话 I/O：校验用户、拉 service-context、转发 SSE、持久化对话、写 Redis 跨轮记忆 |
-| **FulfillmentAgent** | 对外 Agent 入口，100% 委托 `UnifiedTurnPipeline` |
-| **UnifiedTurnPipeline** | 单轮业务决策核心：Plan → Gather → Compose → Verify → Emit |
-| **TurnPlanner** | 轻量路由：意图 + 接话模式；**不**硬编码 Gather 工具清单 |
-| **BoundedGatherReAct** | 有界 ReAct 循环：模型选规则/工具，最多 N 步 |
-| **DecisionComposer** | 唯一成稿 LLM：消费 Gather trace + fact_sheet 输出 JSON |
-| **DecisionVerifier** | 程序校验：预约硬约束、fact 一致性等（非独立 LLM 阶段） |
-| **AgentToolExecutor** | 执行 Agent 工具，桥接诊断引擎与领域查询 |
-| **DiagnosisEngine** | SDS v1：规则树 → Case → 推荐动作（advisory，不直接当用户回复） |
+| Verify 与 Compose 并列 | Verify 在 `DecisionComposer.compose()` 的 **while 循环内** |
+| SDS 与 Tools 平级直连 | SDS 仅在被 **`run_diagnosis` 工具** 调用时运行 |
+| Gather 单向指向 Tools | Tools 的 observation **回写** Gather 下一步 prompt |
+| Sheet 直连 PostgreSQL | 半屏走 **REST API**（如 `/fulfillment-timeline`） |
+| LLM 挂在 Compose 后面 | `LLMService` 被 Plan / Gather / Compose / Polish **共享** |
 
-### 2.2 仓库结构
+### 2.2 核心数据流图解
+
+本节说明 **SDS、规则、Case、大模型** 的分工，以及数据何时回到 LLM。详见下文「谁输出给谁」对照表。
+
+#### 2.2.1 一轮对话总流程（纠正版）
+
+```mermaid
+flowchart TB
+  U["用户输入"]
+
+  subgraph P1["Plan（大模型可选）"]
+    I["IntentClassifier 意图识别"]
+  end
+
+  subgraph P2["Gather：大模型 + 工具循环"]
+    GL["Gather LLM 第 N 步"]
+    T["工具 query_* / search_knowledge"]
+    RD["工具 run_diagnosis"]
+    SDS["SDS DiagnosisEngine（程序）"]
+    GL -->|"选工具"| T
+    GL -->|"选工具"| RD
+    RD --> SDS
+    T -->|"observation 写入 trace"| GL
+    SDS -->|"Case 写入 trace + advisories"| GL
+  end
+
+  subgraph P3["程序汇总（不用大模型）"]
+    FS["fact_sheet 事实表"]
+  end
+
+  subgraph P4["Compose 成稿模块"]
+    CL["Compose LLM 输出 JSON"]
+    V["DecisionVerifier 程序校验"]
+    CL --> V
+    V -->|"不通过"| CL
+  end
+
+  subgraph P5["Emit"]
+    E["ReplyPolisher + token 流式 → 用户"]
+  end
+
+  U --> I --> GL
+  GL -->|"gather_complete"| FS
+  FS --> CL
+  V -->|"通过"| E
+```
+
+**读图要点**：
+
+- **Verify 不在 Compose 外面**，而是成稿模块内部的「写完 → 质检 → 不合格重写」。
+- **SDS 结果必回 LLM**：Gather 下一步 prompt 含上一步 observation；Gather 结束后 Compose prompt 含完整 trace + 诊断块。
+- **fact_sheet** 是 Gather + 工具查库 + 规则程序 + SDS Case 标签的程序汇总；**不含** Gather LLM 的 thought。
+
+#### 2.2.2 SDS / run_diagnosis / 大模型关系
+
+```mermaid
+flowchart LR
+  GL["Gather LLM<br/>决定调 run_diagnosis"]
+  RD["run_diagnosis<br/>（Agent 工具）"]
+  SDS["SDS 模块<br/>DiagnosisEngine"]
+  TR["trace + diagnosis_advisories"]
+  CL["Compose LLM<br/>读 trace + Case 写人话"]
+
+  GL --> RD --> SDS --> TR
+  TR -->|"Gather 下一步"| GL
+  TR -->|"Gather 结束后"| CL
+```
+
+| 概念 | 类型 | 说明 |
+|------|------|------|
+| **SDS** | 独立程序模块 | 73 Case 注册表 + 诊断树；同样输入同样输出 |
+| **run_diagnosis** | Agent 工具名 | Gather 阶段「申请跑一次 SDS」的入口 |
+| **Case** | SDS 输出 | 如 PC-010；写入 trace / fact_sheet，**不直接展示给用户** |
+| **Rules** | 程序函数 | `usage_rules` 等；算「须预约/周末/营业」等客观约束 |
+| **Gather LLM** | 大模型 | 决定查什么、何时 `gather_complete` |
+| **Compose LLM** | 大模型 | 读 SDS 结论 + 事实，翻译成人话（**不再调工具**） |
+
+#### 2.2.3 Compose 内部校验循环
+
+```mermaid
+flowchart LR
+  A["Compose LLM<br/>输出 JSON"] --> B{"DecisionVerifier<br/>程序检查"}
+  B -->|"通过"| C["返回 reply<br/>→ Emit 流式输出"]
+  B -->|"失败<br/>如：须预约却说可直接核销"| D["错误写入 retry prompt"]
+  D --> A
+```
+
+Verify 检查 Compose **刚生成的 JSON**（`reply` 非空、预约禁句等）。用户只见最终通过的 reply。
+
+#### 2.2.4 模块输出对照表（谁传给谁）
+
+| 从 | 到 | 传递内容 |
+|----|-----|----------|
+| `query_*` 等工具 | Gather LLM | observation（订单/券/门店 JSON） |
+| SDS（经 run_diagnosis） | Gather LLM | observation（Case + 诊断步骤 + 推荐动作） |
+| Gather trace + SDS | Compose LLM | fact_sheet + 完整 trace + `_diagnosis_block` |
+| Compose LLM | DecisionVerifier | JSON（含 `reply`） |
+| DecisionVerifier | Compose LLM | 错误列表（仅失败时，触发重写） |
+| Compose（通过后） | 用户 | Emit → `thinking_token` + `token` SSE |
+| Orchestrator | Redis | `build_agent_context`（下轮续问/致谢） |
+
+#### 2.2.5 走查示例（user_096）
+
+```text
+用户：「没预约能核销吗」
+
+① Plan → Intent: CheckVoucherAvailability
+② Gather 第1步 LLM → query_focus_bundle → observation 回 trace
+③ Gather 第2步 LLM（见上步 observation）→ run_diagnosis → SDS → PC-010 回 trace
+④ Gather 第3步 LLM → gather_complete
+⑤ 程序 fact_sheet（needs_reservation=true, diagnosis_case_id=PC-010 …）
+⑥ Compose LLM（输入 trace + fact_sheet + 诊断块）→ JSON reply
+⑦ Verify（Composer 内部）→ 通过
+⑧ Emit → 用户看到思考区 + 「须先预约才能核销 📅…」
+```
+
+### 2.3 仓库结构
 
 ```text
 smart-assistant/
@@ -141,7 +306,7 @@ smart-assistant/
 
 ## 3. 统一 Turn Pipeline（核心）
 
-每一轮用户消息走固定五段：**Plan → Gather → Compose → Verify → Emit**。
+每一轮用户消息走：**Plan → Gather → fact_sheet → Compose（内含 Verify 循环）→ Emit**。
 
 ### 3.1 时序图
 
@@ -265,25 +430,36 @@ sequenceDiagram
 
 ---
 
-### 3.4 fact_sheet — 事实表（程序抽取）
+### 3.4 fact_sheet — 事实表（独立程序模块）
 
-**文件**：`fact_sheet.py`
+**文件**：`fact_sheet.py`（**不属于 SDS**；Gather 结束后由 Pipeline 调用 `build_fact_sheet()`）
 
-从 `tool_calls` + 诊断结果 + `service_context` **程序抽取**结构化事实，供 Compose 与 Verify 使用。模型不可编造 fact_sheet 之外的字段。
+**定位**：Gather 阶段产出的 **canonical 事实锚点**——给 Compose 读、给 Verify 拦、给 Redis 跨轮记忆存 compact 版。与 Gather **trace**（含 LLM thought / 完整 observation）**并行互补**，不是 trace 的重复摘要，也**不汇总大模型推理话术**。
 
-**典型字段**：
+**数据来源**：
+
+| 来源 | 写入 fact_sheet 的内容 |
+|------|------------------------|
+| `service_context` | 焦点订单/券/门店基础字段 |
+| `tool_calls` | `query_focus_bundle`、`query_order` 等查库结果 |
+| `usage_rules.reservation_context` | `needs_reservation`、`has_reservation` 等程序推导 |
+| `diagnosis_advisories`（SDS 经 run_diagnosis） | 仅 `diagnosis_case_id`、`diagnosis_case_name` |
+
+**典型字段**（以 `build_fact_sheet` 实际产出为准）：
 
 | 字段 | 含义 |
 |------|------|
-| `order_title` | 订单标题 |
-| `order_status` | 订单状态（unused/scheduled/used 等） |
+| `focus_order_id` / `order_id` | 焦点订单 |
+| `order_title` / `order_status` | 订单标题与状态 |
 | `usage_rule` | 券面使用规则原文 |
-| `needs_reservation` | 是否须预约（程序解析） |
-| `has_reservation` | 是否已有预约记录 |
-| `store_name` / `store_phone` | 门店信息 |
-| `business_status` | 营业状态 |
-| `diagnosis_case_id` | 诊断 Case（内部用，不展示给用户） |
-| `can_refund` | 是否可退 |
+| `voucher_code` / `voucher_status` | 券码与券状态 |
+| `needs_reservation` / `has_reservation` | 是否须预约 / 是否已有预约（程序解析） |
+| `reservation_label` / `reservation_detail` | 预约要求人话标签与细节 |
+| `store_name` / `store_phone` / `store_hours` | 门店信息 |
+| `supports_reservation` | 门店是否支持预约 |
+| `diagnosis_case_id` / `diagnosis_case_name` | SDS Case（内部用，不展示给用户） |
+
+完整 Gather trace、诊断推荐动作仍在 Compose prompt 的 **trace 块** 与 **`_diagnosis_block`** 中，不在 fact_sheet 重复展开。
 
 ---
 
@@ -456,7 +632,7 @@ Intent 意图
 
 **文件**：`intent.py` — `INTENT_CATALOG`
 
-共 **27** 个可路由意图（含 chitchat/clarify/unconfigured）：
+共 **26** 个可路由意图（含 chitchat/clarify/unconfigured）：
 
 | Intent | 中文说明 |
 |--------|----------|

@@ -12,7 +12,7 @@
 |------|------|
 | **产品形态** | 手机壳内的会话式服务界面，不是独立 FAQ 机器人 |
 | **核心任务** | 查单、解释规则、诊断失败原因、引导办理（预约/退款/转人工等） |
-| **技术特点** | 统一 **Plan → Gather ReAct → Compose → Verify → Emit** 管线；Gather 由模型选工具/规则，Compose 单次成稿 |
+| **技术特点** | 统一 **Plan → Gather → fact_sheet → Compose（含 Verify）→ Emit** 管线；Gather 由模型选工具/规则 |
 | **数据原则** | 数据库只存客观业务事实；诊断 Case 在运行时由引擎 + 智能体推理得出 |
 | **演示规模** | 120 个 Mock 用户（80 正常履约 + 40 异常样本），一键切换 |
 
@@ -50,10 +50,9 @@
 │         └─ UnifiedTurnPipeline（统一 Turn 管线）                 │
 │              ├─ TurnPlanner        意图路由 + 接话模式           │
 │              ├─ BoundedGatherReAct 有界 Gather（模型选工具）     │
-│              ├─ fact_sheet           程序抽取结构化事实            │
-│              ├─ DecisionComposer     单次成稿 LLM                │
-│              ├─ DecisionVerifier     程序校验（预约硬约束等）    │
-│              └─ ReplyPolisher        可选语气润色 + emoji        │
+│              ├─ fact_sheet           程序汇总事实（独立模块，非 SDS）│
+│              ├─ DecisionComposer     单次成稿 LLM（内含 Verify 校验）│
+│              └─ ReplyPolisher        可选语气润色 + emoji            │
 │                                                                  │
 │  AgentToolExecutor → LifeServiceTools → DiagnosisEngine（SDS）   │
 └──────────────┬──────────────────────────────┬───────────────────┘
@@ -70,12 +69,10 @@
       关键词/轻量 LLM 识别意图；判定接话模式（新话题/续问/致谢）
   → BoundedGatherReAct（Gather · 核实）
       模型决定查哪些规则、调用哪些只读工具或 run_diagnosis；最多 3 步
-  → build_fact_sheet（事实表）
-      从工具结果 + 诊断输出程序抽取不可编造的事实
-  → DecisionComposer（Compose · 成稿）
-      唯一成稿 LLM：理解 + 推理 + 自监督 + 回复 + 建议动作
-  → DecisionVerifier（Verify · 校验）
-      程序检查回复是否与 fact_sheet 一致；预约类硬约束正则拦截
+  → build_fact_sheet（事实表 · 独立程序模块）
+      汇总工具查库结果 + usage_rules 推导 + SDS Case 标签；不汇总 LLM thought
+  → DecisionComposer（Compose · 成稿，内含 Verify）
+      唯一成稿 LLM；Verify 在模块内部检查 JSON，失败则同一 LLM 重写
   → Emit（输出）
       thinking_token 推送推理；token 流式推送正式回复
 ```
@@ -101,9 +98,8 @@ Mock 数据写入的是平台/商家/用户侧**可观测事实**：
 | 阶段 | 谁做主 | 做什么 |
 |------|--------|--------|
 | **Gather ReAct** | 大模型 | 决定核对哪些规则、调用什么工具 |
-| **fact_sheet** | 程序 | 结构化抽取，防止 Compose 编造 |
-| **Compose** | 大模型 | 单次成稿，输出用户可读回复 |
-| **Verify** | 程序 | 预约须约时禁止「直接核销」等违规话术 |
+| **fact_sheet** | 程序 | 汇总查库 + 规则 + Case 标签；供 Compose/Verify/跨轮记忆 |
+| **Compose** | 大模型 | 单次成稿（模块内部含 Verify 程序校验） |
 | **写操作** | 用户确认 | Gather 阶段禁止写；需 `ActionSheet` 确认 |
 
 ### 3. 思考区透传真实推理
