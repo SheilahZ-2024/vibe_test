@@ -32,7 +32,8 @@
 
 已实现：
 
-- **Plan → Gather ReAct → Compose** 统一 Pipeline + SDS 诊断
+- **Plan → Gather ReAct → Compose → Verify → Emit** 统一 Pipeline + SDS 诊断
+- Gather 由模型主导选规则/工具；Compose 单次成稿（默认不二次润色）
 - 120 用户 mock 场 + 流式思考（真实推理）与流式回复
 - 履约时间线、操作记录、退款可视化
 

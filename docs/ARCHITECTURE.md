@@ -2,6 +2,9 @@
 
 AI 履约服务管家的技术分层、关键设计与数据流。
 
+> 主链路：**TurnPlanner → BoundedGatherReAct → DecisionComposer → DecisionVerifier → Emit**  
+> 旧版多轮 ReAct + 独立润色已移除；`fulfillment_agent.py` 仅作 Pipeline 薄封装。
+
 ---
 
 ## 1. 设计目标

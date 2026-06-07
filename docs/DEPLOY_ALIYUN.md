@@ -73,6 +73,12 @@ curl -s http://127.0.0.1:5173/health
 浏览器：`http://你的公网IP:5173`  
 Demo 用户见 [DEMO_GUIDE.md](./DEMO_GUIDE.md)。
 
+**冒烟测试**（验证 Gather ReAct + 流式思考）：
+
+1. 切换 Demo 用户 **user_096**
+2. 发送：「没预约能核销吗」
+3. 确认：思考区有灰字推理流；正式回复含 emoji 与可执行建议
+
 ---
 
 ## 五、日常更新（本机 PowerShell）
@@ -99,7 +105,8 @@ cd /root/smart-assistant &&
 ```
 
 > 日常更新**不要** `down -v`，除非修改了 `POSTGRES_PASSWORD`。  
-> seed 版本升级时，api 重启会自动重灌 mock 数据。
+> seed 版本升级时，api 重启会自动重灌 mock 数据。  
+> `.env` 含 `LLM_API_KEY`，**勿提交 git**；每次部署用 scp 同步本地 `.env`。
 
 若使用 Git 更新：
 
